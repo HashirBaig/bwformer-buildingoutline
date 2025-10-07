@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import os
 import time
@@ -252,7 +252,7 @@ def main():
     log_dir = "./tensorboard/test"
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = os.path.join(log_dir, current_time)
-    # 确保目录存在
+    # ç¡®ä¿ç›®å½•å­˜åœ¨
     os.makedirs(log_dir, exist_ok=True)
 
     writer = SummaryWriter(log_dir=log_dir)
@@ -455,16 +455,16 @@ def process_each_corner_sample(data, max_corner_num):
 def nms_group(pred_corners, pred_logits, dist_thresh=5.0, score_thresh=0.01):
     new_corners = []
 
-    n = 2  # 每n个为一组，可调整
+    n = 2  # æ¯nä¸ªä¸ºä¸€ç»„ï¼Œå¯è°ƒæ•´
     for i in range(0, len(pred_logits), n):
         group_corners = pred_corners[i:i+n]
         group_logits = pred_logits[i:i+n]
 
-        # 转为 numpy
+        # è½¬ä¸º numpy
         group_corners = np.array(group_corners)
         group_logits = np.array(group_logits).reshape(-1)
 
-        # 去掉低置信度
+        # åŽ»æŽ‰ä½Žç½®ä¿¡åº¦
         valid_mask = group_logits >= score_thresh
         group_corners = group_corners[valid_mask]
         group_logits = group_logits[valid_mask]
@@ -472,7 +472,7 @@ def nms_group(pred_corners, pred_logits, dist_thresh=5.0, score_thresh=0.01):
         if len(group_corners) == 0:
             continue
 
-        # 排序
+        # æŽ’åº
         order = np.argsort(-group_logits)
         group_corners = group_corners[order]
         group_logits = group_logits[order]

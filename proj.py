@@ -389,73 +389,92 @@ def _rdp(points, eps):
     else:
         return np.vstack([a, b])
 
-def _simplify_ring_projected(ring_xy, d_min_px=4.0, angle_eps_deg=5.0, rdp_tol_px=3.0):
+
+def _dedupe_ring_pixels(ring_xy, px_eps=1.0):
     """
-    Simplify a projected ring (Nx2) by:
-    1) merging consecutive points closer than d_min_px (average),
-    2) removing near-collinear points using angle threshold,
-    3) ensuring start/end are not within d_min_px (merge if so).
-    Returns simplified Nx2 array (may be <3, caller should check).
+    Remove consecutive vertices that fall on the same (rounded) pixel,
+    including the wrap-around between the last and first vertex.
     """
     ring = np.asarray(ring_xy, dtype=np.float64)
     if ring.shape[0] < 3:
         return ring
-    # Step 1: merge consecutive close points
-    merged = []
-    i = 0
-    N = ring.shape[0]
-    while i < N:
-        acc = [ring[i]]
-        j = (i + 1)
-        while j < N and np.linalg.norm(ring[j] - acc[-1]) < d_min_px:
-            acc.append(ring[j])
-            j += 1
-        merged.append(np.mean(acc, axis=0))
-        i = j
-    ring = np.array(merged, dtype=np.float64)
+
+    q = np.rint(ring[:, :2]).astype(int)
+    keep = [ring[0]]
+    for i in range(1, len(ring)):
+        if np.linalg.norm(q[i] - q[i-1]) > px_eps:
+            keep.append(ring[i])
+
+    ring = np.array(keep, dtype=np.float64)
     if ring.shape[0] < 3:
         return ring
-    # Step 2: RDP simplification (robust to tiny kinks)
-    ring = _rdp(ring, rdp_tol_px)
-    if ring.shape[0] < 3:
-        return ring
-    # Step 3: remove near-collinear points (final pass)
-    def is_collinear(a, b, c, angle_eps_deg):
-        v1 = b - a
-        v2 = c - b
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6:
-            return True
-        u1 = v1 / n1
-        u2 = v2 / n2
-        # Use sine of angle as deviation from 0/180 degrees
-        sin_a = float(np.linalg.norm(np.cross(np.append(u1, 0.0), np.append(u2, 0.0))))
-        from math import sin, radians
-        thr = sin(radians(angle_eps_deg))
-        return sin_a <= thr
-    keep = [True] * len(ring)
-    changed = True
-    while changed and len(ring) >= 3:
-        changed = False
-        M = len(ring)
-        to_keep = []
-        for i in range(M):
-            a = ring[(i - 1) % M]
-            b = ring[i]
-            c = ring[(i + 1) % M]
-            if is_collinear(a, b, c, angle_eps_deg):
-                # drop b if removing keeps polygon valid
-                continue
-            to_keep.append(b)
-        if len(to_keep) >= 3 and len(to_keep) < len(ring):
-            ring = np.array(to_keep, dtype=np.float64)
-            changed = True
-    # Step 4: ensure start/end not too close
-    if ring.shape[0] >= 3 and np.linalg.norm(ring[0] - ring[-1]) < d_min_px:
-        mean = (ring[0] + ring[-1]) / 2.0
-        ring = np.vstack([mean, ring[1:-1]])
+
+    # circular check: last vs first
+    if np.linalg.norm(np.rint(ring[-1, :2]) - np.rint(ring[0, :2])) <= px_eps:
+        ring[0] = (ring[0] + ring[-1]) / 2.0
+        ring = ring[:-1]
+
     return ring
+
+def _simplify_ring_projected(ring_xy, d_min_px=4.0, angle_eps_deg=6.0, rdp_tol_px=3.0):
+    """
+    Simplify a 2D ring in projected pixel space.
+    Steps: merge-nearby (circular) -> RDP -> remove near-180° (circular) -> pixel dedupe
+    """
+    ring = np.asarray(ring_xy, dtype=np.float64)
+    if ring.shape[0] < 3:
+        return ring
+
+    # 1) Merge consecutive points that are too close (CIRCULAR)
+    tmp = [ring[0]]
+    for pt in ring[1:]:
+        if np.linalg.norm(pt[:2] - tmp[-1][:2]) > d_min_px:
+            tmp.append(pt)
+    ring = np.array(tmp, dtype=np.float64)
+    if ring.shape[0] >= 2 and np.linalg.norm(ring[0, :2] - ring[-1, :2]) <= d_min_px:
+        # average the endpoints to avoid a micro edge at the wrap-around
+        ring[0] = (ring[0] + ring[-1]) / 2.0
+        ring = ring[:-1]
+    if ring.shape[0] < 3:
+        return ring
+
+    # 2) RDP simplification (on 2D)
+    from shapely.geometry import LineString
+    line = LineString(ring[:, :2])
+    simplified_line = line.simplify(rdp_tol_px, preserve_topology=False)
+    ring = np.array(simplified_line.coords, dtype=np.float64)
+    if ring.shape[0] < 3:
+        return ring
+
+    # 3) Remove near-collinear vertices (angles ~180°), CIRCULAR
+    def interior_angle(a, b, c):
+        ba, bc = a - b, c - b
+        na, nc = np.linalg.norm(ba), np.linalg.norm(bc)
+        if na == 0 or nc == 0:
+            return 180.0
+        cosang = np.clip(np.dot(ba, bc) / (na * nc), -1.0, 1.0)
+        return np.degrees(np.arccos(cosang))
+
+    n = len(ring)
+    keep = []
+    for i in range(n):
+        a = ring[(i - 1) % n, :2]
+        b = ring[i, :2]
+        c = ring[(i + 1) % n, :2]
+        ang = interior_angle(a, b, c)
+        # drop if nearly straight (within angle_eps of 180°)
+        if (180.0 - ang) >= angle_eps_deg:
+            keep.append(ring[i])
+    ring = np.array(keep, dtype=np.float64)
+    if ring.shape[0] < 3:
+        return ring
+
+    # 4) Final pixel-space dedupe (circular) to kill double corners
+    ring = _dedupe_ring_pixels(ring, px_eps=1.0)
+
+    return ring
+
+
 
 def simplify_and_rebuild_from_projected_rings(wf_vertices_proj, rings_idx, d_min_px=4.0, angle_eps_deg=5.0):
     """
@@ -715,6 +734,33 @@ def collapse_short_edges(vertices_proj, edges_idx, min_len_px=4.0):
     return new_vertices, new_edges, idx_map
 
 
+def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0.20, verbose=False):
+    """
+    Adaptive wrapper over collapse_short_edges:
+      - Computes the current edge-length distribution (in pixel space)
+      - Uses tau = max(base_px, alpha * median_length) as the threshold
+    Returns (new_vertices, new_edges, idx_map), and prints tau if verbose.
+    """
+    V = np.asarray(vertices_proj, dtype=np.float64)
+    E = np.asarray(edges_idx, dtype=np.int32)
+    if V.size == 0 or E.size == 0:
+        return V, E, np.arange(V.shape[0], dtype=np.int32)
+
+    # edge lengths
+    L = np.linalg.norm(V[E[:, 0], :2] - V[E[:, 1], :2], axis=1)
+    if L.size == 0:
+        return V, E, np.arange(V.shape[0], dtype=np.int32)
+
+    tau = float(max(base_px, alpha * np.median(L)))
+    if verbose:
+        try:
+            print(f"[adaptive] collapse_short_edges: median={np.median(L):.2f}px  tau={tau:.2f}px  (base={base_px}, alpha={alpha})")
+        except Exception:
+            pass
+
+    return collapse_short_edges(V, E, min_len_px=tau)
+
+
 def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     with open(train_list_path, 'r') as f:
         train_names = [line.strip() for line in f if line.strip()]
@@ -861,7 +907,7 @@ def main():
 
         # Safety merges: epsilon merge, collapse short edges, and pixel-snap merge
         wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
-        wf_vertices, wf_edges, _ = collapse_short_edges(wf_vertices, wf_edges, min_len_px=4.0)
+        wf_vertices, wf_edges, _ = collapse_short_edges_adaptive(wf_vertices, wf_edges, base_px=4.0, alpha=0.20, verbose=False)
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
 
         # Integrity counts after merge
@@ -970,7 +1016,7 @@ def get_wireframe_overlay(NPY_PATH,IMG_PATH, OUT_PATH):
         # Epsilon-based merge in overlay (robust against near duplicates)
         V, E, _ = merge_vertices_eps(V, E, eps_px=4.0)
         # Collapse short edges in overlay too
-        V, E, _ = collapse_short_edges(V, E, min_len_px=4.0)
+        V, E, _ = collapse_short_edges_adaptive(V, E, base_px=4.0, alpha=0.20, verbose=False)
         px = np.rint(V[:, 0]).astype(int)
         py = np.rint(V[:, 1]).astype(int)
         key_to_new = {}

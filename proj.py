@@ -355,6 +355,157 @@ def label_points_projected(points_xy, rings_proj, eps_px=1.5):
         'instance_id': instance_id
     }
 
+def _rdp(points, eps):
+    """
+    Ramer–Douglas–Peucker for 2D polyline (numpy array Nx2).
+    Returns simplified points in order.
+    """
+    P = np.asarray(points, dtype=np.float64)
+    if P.shape[0] <= 2:
+        return P
+    # perpendicular distance of point p to segment ab
+    def _perp_dist(p, a, b):
+        ab = b - a
+        if np.allclose(ab, 0):
+            return float(np.linalg.norm(p - a))
+        t = np.dot(p - a, ab) / np.dot(ab, ab)
+        t = max(0.0, min(1.0, t))
+        proj = a + t * ab
+        return float(np.linalg.norm(p - proj))
+    # recursive
+    a = P[0]
+    b = P[-1]
+    dmax = -1.0
+    idx = -1
+    for i in range(1, len(P) - 1):
+        d = _perp_dist(P[i], a, b)
+        if d > dmax:
+            idx = i
+            dmax = d
+    if dmax > eps:
+        left = _rdp(P[: idx + 1], eps)
+        right = _rdp(P[idx:], eps)
+        return np.vstack([left[:-1], right])
+    else:
+        return np.vstack([a, b])
+
+def _simplify_ring_projected(ring_xy, d_min_px=4.0, angle_eps_deg=5.0, rdp_tol_px=3.0):
+    """
+    Simplify a projected ring (Nx2) by:
+    1) merging consecutive points closer than d_min_px (average),
+    2) removing near-collinear points using angle threshold,
+    3) ensuring start/end are not within d_min_px (merge if so).
+    Returns simplified Nx2 array (may be <3, caller should check).
+    """
+    ring = np.asarray(ring_xy, dtype=np.float64)
+    if ring.shape[0] < 3:
+        return ring
+    # Step 1: merge consecutive close points
+    merged = []
+    i = 0
+    N = ring.shape[0]
+    while i < N:
+        acc = [ring[i]]
+        j = (i + 1)
+        while j < N and np.linalg.norm(ring[j] - acc[-1]) < d_min_px:
+            acc.append(ring[j])
+            j += 1
+        merged.append(np.mean(acc, axis=0))
+        i = j
+    ring = np.array(merged, dtype=np.float64)
+    if ring.shape[0] < 3:
+        return ring
+    # Step 2: RDP simplification (robust to tiny kinks)
+    ring = _rdp(ring, rdp_tol_px)
+    if ring.shape[0] < 3:
+        return ring
+    # Step 3: remove near-collinear points (final pass)
+    def is_collinear(a, b, c, angle_eps_deg):
+        v1 = b - a
+        v2 = c - b
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return True
+        u1 = v1 / n1
+        u2 = v2 / n2
+        # Use sine of angle as deviation from 0/180 degrees
+        sin_a = float(np.linalg.norm(np.cross(np.append(u1, 0.0), np.append(u2, 0.0))))
+        from math import sin, radians
+        thr = sin(radians(angle_eps_deg))
+        return sin_a <= thr
+    keep = [True] * len(ring)
+    changed = True
+    while changed and len(ring) >= 3:
+        changed = False
+        M = len(ring)
+        to_keep = []
+        for i in range(M):
+            a = ring[(i - 1) % M]
+            b = ring[i]
+            c = ring[(i + 1) % M]
+            if is_collinear(a, b, c, angle_eps_deg):
+                # drop b if removing keeps polygon valid
+                continue
+            to_keep.append(b)
+        if len(to_keep) >= 3 and len(to_keep) < len(ring):
+            ring = np.array(to_keep, dtype=np.float64)
+            changed = True
+    # Step 4: ensure start/end not too close
+    if ring.shape[0] >= 3 and np.linalg.norm(ring[0] - ring[-1]) < d_min_px:
+        mean = (ring[0] + ring[-1]) / 2.0
+        ring = np.vstack([mean, ring[1:-1]])
+    return ring
+
+def simplify_and_rebuild_from_projected_rings(wf_vertices_proj, rings_idx, d_min_px=4.0, angle_eps_deg=5.0):
+    """
+    Given projected vertices (Nx3) and ring index lists, simplify each ring in pixel space
+    and rebuild a global vertex/edge list. Uses integer pixel rounding to deduplicate
+    across rings while preserving ring connectivity.
+    Returns (new_vertices_proj (Nx3), new_edges (Mx2), new_rings_idx).
+    """
+    V = np.asarray(wf_vertices_proj, dtype=np.float64)
+    all_new_idxs = []
+    key_to_idx = {}
+    new_vertices = []
+    def get_idx_from_xy(x, y, z):
+        key = (int(round(x)), int(round(y)))
+        if key in key_to_idx:
+            return key_to_idx[key]
+        idx = len(new_vertices)
+        key_to_idx[key] = idx
+        new_vertices.append([key[0], key[1], float(z)])
+        return idx
+    for idxs in rings_idx:
+        ring_xy = V[np.array(idxs, dtype=np.int32), :2]
+        simp = _simplify_ring_projected(ring_xy, d_min_px=d_min_px, angle_eps_deg=angle_eps_deg)
+        if simp.shape[0] < 3:
+            all_new_idxs.append([])
+            continue
+        ring_new_idx = []
+        # use mean Z of original ring for z channel
+        z_mean = float(np.mean(V[np.array(idxs, dtype=np.int32), 2])) if V.shape[1] >= 3 else 0.0
+        for p in simp:
+            ring_new_idx.append(get_idx_from_xy(p[0], p[1], z_mean))
+        all_new_idxs.append(ring_new_idx)
+    # Build edges
+    edges = set()
+    for ridx in all_new_idxs:
+        n = len(ridx)
+        if n < 3:
+            continue
+        for i in range(n):
+            a = ridx[i]
+            b = ridx[(i + 1) % n]
+            if a == b:
+                continue
+            if a > b:
+                a, b = b, a
+            edges.add((a, b))
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(edges)), dtype=np.int32) if len(edges) > 0 else np.zeros((0, 2), dtype=np.int32)
+    return new_vertices, new_edges, all_new_idxs
+
 
 def merge_vertices_projected(vertices_proj, edges_idx, snap_to_int=True):
     """
@@ -700,15 +851,17 @@ def main():
             rings_proj.append(ring_xy)
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
 
-        # Integrity counts before merge
+        # Integrity counts before projected simplification/merge
         v_before = int(wf_vertices.shape[0])
         e_before = int(wf_edges.shape[0])
 
-        # Merge projected vertices that are within epsilon pixels to avoid duplicates
+        # Simplify rings in projected pixel space and rebuild wireframe
+        wf_vertices, wf_edges, rings_idx = simplify_and_rebuild_from_projected_rings(
+            wf_vertices, rings_idx, d_min_px=4.0, angle_eps_deg=5.0)
+
+        # Safety merges: epsilon merge, collapse short edges, and pixel-snap merge
         wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
-        # Collapse very short edges (tiny kinks near corners)
         wf_vertices, wf_edges, _ = collapse_short_edges(wf_vertices, wf_edges, min_len_px=4.0)
-        # Ensure any vertices falling on the same pixel are merged as well
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
 
         # Integrity counts after merge

@@ -733,32 +733,135 @@ def collapse_short_edges(vertices_proj, edges_idx, min_len_px=4.0):
     new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
     return new_vertices, new_edges, idx_map
 
-
-def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0.20, verbose=False):
+def _choose_cluster_representatives(V, E, clusters):
     """
-    Adaptive wrapper over collapse_short_edges:
-      - Computes the current edge-length distribution (in pixel space)
-      - Uses tau = max(base_px, alpha * median_length) as the threshold
-    Returns (new_vertices, new_edges, idx_map), and prints tau if verbose.
+    For each cluster (list of vertex ids), choose one existing vertex to keep
+    instead of averaging. We pick the member whose incident edges to vertices
+    OUTSIDE the cluster have the largest total length.
+    """
+    V = np.asarray(V, dtype=np.float64)
+    E = np.asarray(E, dtype=np.int32)
+    # build adjacency for quick lookups
+    from collections import defaultdict
+    adj = defaultdict(list)
+    for a,b in E:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+
+    reps = {}  # root -> chosen vertex id
+    for root, members in clusters.items():
+        member_set = set(members)
+        best = members[0]
+        best_score = -1.0
+        for m in members:
+            score = 0.0
+            for n in adj.get(int(m), []):
+                if n in member_set:  # ignore edges inside cluster
+                    continue
+                score += np.linalg.norm(V[m,:2] - V[n,:2])
+            if score > best_score:
+                best_score = score
+                best = m
+        reps[root] = best
+    return reps
+
+
+def _rebuild_from_clusters_snap(V, E, clusters, representatives):
+    """
+    Rebuild vertices/edges by snapping each cluster to its chosen representative's
+    original coordinates (no averaging). Z is taken from the representative too.
+    """
+    V = np.asarray(V, dtype=np.float64)
+    n = V.shape[0]
+    # map old vertex -> new id (cluster index order)
+    new_index = {}
+    new_vertices = []
+    for new_id, (root, members) in enumerate(clusters.items()):
+        rep = representatives[root]
+        new_vertices.append(V[rep].tolist())
+        for m in members:
+            new_index[m] = new_id
+
+    idx_map = np.array([new_index[i] for i in range(n)], dtype=np.int32)
+
+    # remap edges, drop self-loops & duplicates
+    new_edges = set()
+    for a,b in E:
+        A = int(idx_map[int(a)])
+        B = int(idx_map[int(b)])
+        if A == B:
+            continue
+        if A > B:
+            A,B = B,A
+        new_edges.add((A,B))
+
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(new_edges)), dtype=np.int32) if len(new_edges) > 0 else np.zeros((0,2), dtype=np.int32)
+    return new_vertices, new_edges, idx_map
+
+
+def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True):
+    """
+    Adaptive short-edge collapse with optional endpoint snapping (no averaging).
+    tau = max(base_px, alpha * median_edge_length)
     """
     V = np.asarray(vertices_proj, dtype=np.float64)
     E = np.asarray(edges_idx, dtype=np.int32)
     if V.size == 0 or E.size == 0:
         return V, E, np.arange(V.shape[0], dtype=np.int32)
 
-    # edge lengths
-    L = np.linalg.norm(V[E[:, 0], :2] - V[E[:, 1], :2], axis=1)
+    L = np.linalg.norm(V[E[:,0],:2] - V[E[:,1],:2], axis=1)
     if L.size == 0:
         return V, E, np.arange(V.shape[0], dtype=np.int32)
 
-    tau = float(max(base_px, alpha * np.median(L)))
+    tau = float(max(base_px, alpha * float(np.median(L))))
     if verbose:
         try:
-            print(f"[adaptive] collapse_short_edges: median={np.median(L):.2f}px  tau={tau:.2f}px  (base={base_px}, alpha={alpha})")
+            print(f"[adaptive] collapse_short_edges: median={np.median(L):.2f}px  tau={tau:.2f}px")
         except Exception:
             pass
 
-    return collapse_short_edges(V, E, min_len_px=tau)
+    # --- union-find over edges <= tau (same as your collapse_short_edges) ---
+    n = V.shape[0]
+    parent = list(range(n))
+    rank = [0]*n
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    def union(a,b):
+        ra, rb = find(a), find(b)
+        if ra == rb: return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    tau2 = tau*tau
+    for a,b in E:
+        a = int(a); b = int(b)
+        dx = V[a,0]-V[b,0]; dy = V[a,1]-V[b,1]
+        if dx*dx + dy*dy <= tau2:
+            union(a,b)
+
+    # clusters: root -> members
+    clusters = {}
+    for i in range(n):
+        r = find(i)
+        clusters.setdefault(r, []).append(i)
+
+    if not snap_endpoint:
+        # fallback: average (your old behavior)
+        return collapse_short_edges(V, E, min_len_px=tau)
+
+    # NEW: snap each cluster to best endpoint
+    reps = _choose_cluster_representatives(V, E, clusters)
+    return _rebuild_from_clusters_snap(V, E, clusters, reps)
+
 
 
 def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
@@ -907,7 +1010,7 @@ def main():
 
         # Safety merges: epsilon merge, collapse short edges, and pixel-snap merge
         wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
-        wf_vertices, wf_edges, _ = collapse_short_edges_adaptive(wf_vertices, wf_edges, base_px=4.0, alpha=0.20, verbose=False)
+        wf_vertices, wf_edges, _ = collapse_short_edges_adaptive(wf_vertices, wf_edges, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True)
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
 
         # Integrity counts after merge
@@ -1016,7 +1119,7 @@ def get_wireframe_overlay(NPY_PATH,IMG_PATH, OUT_PATH):
         # Epsilon-based merge in overlay (robust against near duplicates)
         V, E, _ = merge_vertices_eps(V, E, eps_px=4.0)
         # Collapse short edges in overlay too
-        V, E, _ = collapse_short_edges_adaptive(V, E, base_px=4.0, alpha=0.20, verbose=False)
+        V, E, _ = collapse_short_edges_adaptive(V, E, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True)
         px = np.rint(V[:, 0]).astype(int)
         py = np.rint(V[:, 1]).astype(int)
         key_to_new = {}

@@ -921,8 +921,6 @@ def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0
 def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     with open(train_list_path, 'r') as f:
         train_names = [line.strip() for line in f if line.strip()]
-    # with open(test_list_path, 'r') as f:
-    #     test_names = [line.strip() for line in f if line.strip()]
     all_names = sorted(set(train_names))
     
     
@@ -931,8 +929,6 @@ def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     for name in all_names:
         p_geo = name + '/polygon' + '.geojson'
         p_json = name + '/polygon' + '.json'
-        
-        print(p_geo)
         if os.path.exists(p_geo):
             files.append(p_geo)
         elif os.path.exists(p_json):
@@ -1016,14 +1012,13 @@ def main():
         print('idx: ',index,' - path: ', base_path)
         image_id = image_id + 1
         pc_file = pc_files[index]
-        pcd = o3d.io.read_point_cloud(pc_file)  # 读取 .ply 文件
+        pcd = o3d.io.read_point_cloud(pc_file)  # read the point cloud file
         point_cloud = np.asarray(pcd.points) 
         name =  os.path.splitext(os.path.basename(pc_file))[0]
         print('point cloud name >> ',name)
     
-        names.append(name)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
-
-         # ------------------------------- Polygons ------------------------------
+        names.append(name)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+        # ------------------------------- Polygons ------------------------------
         # load polygons (no holes) from simple JSON or GeoJSON, then convert to wireframe
         polygon_file = polygon_files[index]
         polygons = load_any_polygons(polygon_file)

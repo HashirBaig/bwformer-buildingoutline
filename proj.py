@@ -189,6 +189,20 @@ def polygons_to_wireframe(polygons):
     rings_idx = []
     edges = set()
 
+    def _clean_ring(ring_arr):
+        # Remove repeated closing point and consecutive duplicates
+        ring = np.asarray(ring_arr, dtype=np.float64)
+        if ring.shape[0] >= 2 and np.allclose(ring[0], ring[-1]):
+            ring = ring[:-1]
+        cleaned = []
+        for pt in ring:
+            if len(cleaned) == 0 or not np.allclose(pt, cleaned[-1]):
+                cleaned.append(pt)
+        # If after cleaning the first and last are equal, drop last
+        if len(cleaned) >= 2 and np.allclose(cleaned[0], cleaned[-1]):
+            cleaned = cleaned[:-1]
+        return np.array(cleaned, dtype=np.float64)
+
     def get_vid(pt):
         key = (float(pt[0]), float(pt[1]))
         if key in vertex_index:
@@ -199,6 +213,10 @@ def polygons_to_wireframe(polygons):
         return idx
 
     for ring in polygons:
+        ring = _clean_ring(ring)
+        # skip degenerate rings
+        if ring.shape[0] < 3:
+            continue
         idxs = [get_vid(pt) for pt in ring]
         rings_idx.append(idxs)
         n = len(idxs)
@@ -411,35 +429,33 @@ def main():
             rings_proj.append(ring_xy)
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
         
-        vertex_con = {}
+        vertex_con = defaultdict(set)
 
         for edge in wf_edges:
-            vertex1, vertex2 = edge
-            if vertex1 not in vertex_con:
-        
-                vertex_con[vertex1] = [vertex2]
-            else:
-                vertex_con[vertex1].append(vertex2)
+            vertex1, vertex2 = int(edge[0]), int(edge[1])
+            if vertex1 == vertex2:
+                continue
+            if vertex1 < 0 or vertex2 < 0 or vertex1 >= wf_vertices.shape[0] or vertex2 >= wf_vertices.shape[0]:
+                continue
+            vertex_con[vertex1].add(vertex2)
+            vertex_con[vertex2].add(vertex1)
 
-            if vertex2 not in vertex_con:
-                vertex_con[vertex2] = [vertex1]
-            else:
-                vertex_con[vertex2].append(vertex1)
-
-        vertex_connections = {}
-        for vertex, edge in vertex_con.items():
-            vertex_connections[tuple(wf_vertices[vertex])] = []
-            for edge_vertex in edge:
-                vertex_connections[tuple(wf_vertices[vertex])].append(np.array(wf_vertices[edge_vertex]))
         vertex_connections1 = {}
-        for vertex, edge in vertex_con.items():
-            vertex_connections1[tuple([wf_vertices[vertex][0], wf_vertices[vertex][1], wf_vertices[vertex][2]])] = []
-            for edge_vertex in edge:
-                vertex_connections1[tuple([wf_vertices[vertex][0], wf_vertices[vertex][1], wf_vertices[vertex][2]])].append(np.array([wf_vertices[edge_vertex][0], wf_vertices[edge_vertex][1], wf_vertices[edge_vertex][2]]))
+        for vertex, neighbors in vertex_con.items():
+            key = tuple([wf_vertices[vertex][0], wf_vertices[vertex][1], wf_vertices[vertex][2]])
+            vertex_connections1[key] = []
+            for edge_vertex in sorted(list(neighbors)):
+                vertex_connections1[key].append(np.array([
+                    wf_vertices[edge_vertex][0],
+                    wf_vertices[edge_vertex][1],
+                    wf_vertices[edge_vertex][2]
+                ]))
         npypath = os.path.join(npy_dir, f"{name}.npy")
         combined = {
             'annot': vertex_connections1,
-            'point_labels': labels
+            'point_labels': labels,
+            'vertices_proj': wf_vertices,     # projected to 0..255 coords
+            'edges_idx': wf_edges            # 0-based indices into vertices_proj
         }
         np.save(npypath, combined)
         image = proj_img(point_cloud, name, proj_dir)

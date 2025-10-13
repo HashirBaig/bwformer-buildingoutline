@@ -800,31 +800,82 @@ def _rebuild_from_clusters_snap(V, E, clusters, representatives):
     return new_vertices, new_edges, idx_map
 
 
+# --- helpers ---------------------------------------------------------------
+def _build_adj(E):
+    from collections import defaultdict
+    adj = defaultdict(list)
+    for a,b in E:
+        a=int(a); b=int(b)
+        adj[a].append(b); adj[b].append(a)
+    return adj
+
+def _line_from_pts(p, q):
+    # returns (u, v) s.t. line(t) = u + t*v
+    u = p[:2].astype(float)
+    v = (q[:2] - p[:2]).astype(float)
+    n = np.linalg.norm(v)
+    if n == 0.0:
+        return u, None
+    return u, v / n
+
+def _angle_between(v1, v2):
+    c = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+    return np.degrees(np.arccos(c))
+
+def _intersect_lines(u1, v1, u2, v2):
+    # Solve u1 + t*v1 = u2 + s*v2  ->  t = cross(u2-u1, v2) / cross(v1, v2)
+    # using 2D scalar cross (z of 3D cross)
+    if v1 is None or v2 is None:
+        return None
+    def cross(a,b): return a[0]*b[1] - a[1]*b[0]
+    den = cross(v1, v2)
+    if abs(den) < 1e-8:
+        return None
+    t = cross(u2 - u1, v2) / den
+    P = u1 + t * v1
+    return P  # 2D
+
+def _choose_endpoint_by_external_length(V, E, members, adj):
+    mset = set(members)
+    best = members[0]
+    best_score = -1.0
+    for m in members:
+        score = 0.0
+        for n in adj.get(int(m), []):
+            if n in mset:  # ignore internal cluster edges
+                continue
+            score += np.linalg.norm(V[m,:2] - V[n,:2])
+        if score > best_score:
+            best_score = score
+            best = m
+    return best
+
+# --- smart adaptive short-edge collapse with intersection snapping ----------
 def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True):
     """
-    Adaptive short-edge collapse with optional endpoint snapping (no averaging).
-    tau = max(base_px, alpha * median_edge_length)
+    Adaptive short-edge collapse with geometric snapping.
+    - Compute tau = max(base_px, alpha * median_edge_length)
+    - Union vertices linked by edges <= tau
+    - For each cluster (>1 vertex), try to snap to the intersection of two
+      dominant external lines; if not possible, snap to best endpoint.
     """
     V = np.asarray(vertices_proj, dtype=np.float64)
     E = np.asarray(edges_idx, dtype=np.int32)
+
     if V.size == 0 or E.size == 0:
         return V, E, np.arange(V.shape[0], dtype=np.int32)
 
+    # lengths & threshold
     L = np.linalg.norm(V[E[:,0],:2] - V[E[:,1],:2], axis=1)
     if L.size == 0:
         return V, E, np.arange(V.shape[0], dtype=np.int32)
-
     tau = float(max(base_px, alpha * float(np.median(L))))
     if verbose:
-        try:
-            print(f"[adaptive] collapse_short_edges: median={np.median(L):.2f}px  tau={tau:.2f}px")
-        except Exception:
-            pass
+        print(f"[adaptive] median={np.median(L):.2f}px  tau={tau:.2f}px")
 
-    # --- union-find over edges <= tau (same as your collapse_short_edges) ---
+    # union-find for edges <= tau
     n = V.shape[0]
-    parent = list(range(n))
-    rank = [0]*n
+    parent = list(range(n)); rank = [0]*n
     def find(a):
         while parent[a] != a:
             parent[a] = parent[parent[a]]
@@ -838,29 +889,99 @@ def collapse_short_edges_adaptive(vertices_proj, edges_idx, base_px=4.0, alpha=0
         elif rank[ra] > rank[rb]:
             parent[rb] = ra
         else:
-            parent[rb] = ra
-            rank[ra] += 1
+            parent[rb] = ra; rank[ra] += 1
 
     tau2 = tau*tau
     for a,b in E:
-        a = int(a); b = int(b)
+        a=int(a); b=int(b)
         dx = V[a,0]-V[b,0]; dy = V[a,1]-V[b,1]
         if dx*dx + dy*dy <= tau2:
             union(a,b)
 
-    # clusters: root -> members
+    # clusters
     clusters = {}
     for i in range(n):
         r = find(i)
         clusters.setdefault(r, []).append(i)
 
-    if not snap_endpoint:
-        # fallback: average (your old behavior)
-        return collapse_short_edges(V, E, min_len_px=tau)
+    adj = _build_adj(E)
 
-    # NEW: snap each cluster to best endpoint
-    reps = _choose_cluster_representatives(V, E, clusters)
-    return _rebuild_from_clusters_snap(V, E, clusters, reps)
+    # build new vertices by snapping
+    new_index = {}
+    new_vertices = []
+    for new_id, (root, members) in enumerate(clusters.items()):
+        if len(members) == 1:
+            m = members[0]
+            new_vertices.append(V[m].tolist())
+            new_index[m] = new_id
+            continue
+
+        # collect external neighbor directions from all members
+        dirs = []   # (origin_id, neighbor_id, dir_vec(unit), length)
+        mset = set(members)
+        for m in members:
+            for nb in adj.get(int(m), []):
+                if nb in mset:  # internal
+                    continue
+                u, v = _line_from_pts(V[m], V[nb])
+                if v is None: 
+                    continue
+                length = np.linalg.norm(V[m,:2] - V[nb,:2])
+                dirs.append((m, nb, v, length))
+
+        snapped_pt = None
+        if len(dirs) >= 2:
+            # pick two strongest non-parallel directions (by length, with angle gap)
+            dirs_sorted = sorted(dirs, key=lambda x: x[3], reverse=True)
+            picked = []
+            for cand in dirs_sorted:
+                if not picked:
+                    picked.append(cand)
+                else:
+                    ok = True
+                    for p in picked:
+                        if _angle_between(cand[2], p[2]) < 12.0:  # avoid near-parallel
+                            ok = False; break
+                    if ok:
+                        picked.append(cand)
+                if len(picked) == 2:
+                    break
+
+            if len(picked) == 2:
+                (m1, n1, v1, _), (m2, n2, v2, _) = picked
+                u1, _ = _line_from_pts(V[m1], V[n1])
+                u2, _ = _line_from_pts(V[m2], V[n2])
+                P = _intersect_lines(u1, v1, u2, v2)
+                if P is not None and np.all(np.isfinite(P)):
+                    # keep Z from the best endpoint (longer external edges)
+                    best = _choose_endpoint_by_external_length(V, E, members, adj)
+                    z = V[best, 2] if V.shape[1] >= 3 else 0.0
+                    snapped_pt = [float(P[0]), float(P[1]), float(z)]
+
+        if snapped_pt is None:
+            # fallback: snap to best endpoint among cluster
+            best = _choose_endpoint_by_external_length(V, E, members, adj)
+            snapped_pt = V[best].tolist()
+
+        new_vertices.append(snapped_pt)
+        for m in members:
+            new_index[m] = new_id
+
+    idx_map = np.array([new_index[i] for i in range(n)], dtype=np.int32)
+
+    # remap edges, drop self-loops/dupes
+    new_edges = set()
+    for a,b in E:
+        A = int(idx_map[int(a)]); B = int(idx_map[int(b)])
+        if A == B: 
+            continue
+        if A > B: 
+            A,B = B,A
+        new_edges.add((A,B))
+
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(new_edges)), dtype=np.int32) if len(new_edges) > 0 else np.zeros((0,2), dtype=np.int32)
+    return new_vertices, new_edges, idx_map
 
 
 

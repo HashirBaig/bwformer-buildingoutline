@@ -300,6 +300,50 @@ def label_points_projected(points_xy, rings_proj, eps_px=1.5):
         'instance_id': instance_id
     }
 
+def merge_vertices_projected(vertices_proj, edges_idx, snap_to_int=True):
+    """
+    Merge projected vertices that land on the same pixel (after optional rounding),
+    and remap edges accordingly. Removes self-loops and duplicate edges.
+    Returns (new_vertices, new_edges, idx_map).
+    """
+    if vertices_proj.size == 0:
+        return vertices_proj, edges_idx, np.arange(0)
+    verts = np.asarray(vertices_proj, dtype=np.float64)
+    edges = np.asarray(edges_idx, dtype=np.int32)
+    if snap_to_int:
+        px = np.rint(verts[:, 0]).astype(int)
+        py = np.rint(verts[:, 1]).astype(int)
+    else:
+        px = verts[:, 0]
+        py = verts[:, 1]
+    keys = list(zip(px.tolist(), py.tolist()))
+
+    key_to_new = {}
+    new_vertices = []
+    for i, key in enumerate(keys):
+        if key in key_to_new:
+            continue
+        key_to_new[key] = len(new_vertices)
+        new_vertices.append([key[0], key[1], verts[i, 2]])
+
+    idx_map = np.empty(len(verts), dtype=np.int32)
+    for i, key in enumerate(keys):
+        idx_map[i] = key_to_new[key]
+
+    new_edges_set = set()
+    for e in edges:
+        a = int(idx_map[int(e[0])])
+        b = int(idx_map[int(e[1])])
+        if a == b:
+            continue
+        if a > b:
+            a, b = b, a
+        new_edges_set.add((a, b))
+
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
+    return new_vertices, new_edges, idx_map
+
 def build_polygon_files(train_list_path, test_list_path, poly_dir="xxx/poly"):
     with open(train_list_path, 'r') as f:
         train_names = [line.strip() for line in f if line.strip()]
@@ -428,6 +472,9 @@ def main():
             ring_xy = wf_vertices[np.array(idxs, dtype=np.int32), :2]
             rings_proj.append(ring_xy)
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
+
+        # Merge projected vertices that snap to the same pixel to avoid duplicates
+        wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
         
         vertex_con = defaultdict(set)
 

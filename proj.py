@@ -202,6 +202,61 @@ def polygons_to_wireframe(polygons):
             cleaned = cleaned[:-1]
         return np.array(cleaned, dtype=np.float64)
 
+    def _simplify_ring_by_angle(ring_arr, angle_eps_deg=3.0, len_eps=1e-9, max_passes=3):
+        """
+        Remove near-collinear intermediate vertices while preserving corners.
+        angle_eps_deg: threshold around 180 degrees; points with turn angle within this
+                        tolerance are treated as collinear and removed.
+        len_eps: ignore extremely small segments.
+        """
+        ring = np.asarray(ring_arr, dtype=np.float64)
+        if ring.shape[0] <= 3:
+            return ring
+        def is_collinear(p_prev, p, p_next):
+            v1 = p - p_prev
+            v2 = p_next - p
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 < len_eps or n2 < len_eps:
+                return True
+            u1 = v1 / n1
+            u2 = v2 / n2
+            # angle between u1 and u2; 180 deg means straight line (cos ~ -1)
+            cos_a = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
+            # convert to deviation from 180 degrees: cos(pi - a) = -cos(a)
+            # We can check |sin| as indicator of deviation from straight
+            sin_a = float(np.linalg.norm(np.cross(np.append(u1,0), np.append(u2,0))))
+            # If sin is small, vectors nearly collinear
+            from math import sin, radians
+            thr = sin(radians(angle_eps_deg))
+            return sin_a <= thr
+        pts = ring.tolist()
+        # ensure closed handling by modular indexing but store as open ring
+        for _ in range(max_passes):
+            keep = [True] * len(pts)
+            changed = False
+            m = len(pts)
+            if m <= 3:
+                break
+            for i in range(m):
+                p_prev = np.array(pts[(i - 1) % m])
+                p = np.array(pts[i])
+                p_next = np.array(pts[(i + 1) % m])
+                if is_collinear(p_prev, p, p_next):
+                    keep[i] = False
+            # Ensure we don't remove all points; keep at least 3 and keep extreme if all marked
+            new_pts = [pt for k, pt in zip(keep, pts) if k]
+            if len(new_pts) < 3:
+                # fall back to original if over-pruned
+                break
+            if len(new_pts) == len(pts):
+                break
+            pts = new_pts
+            changed = True
+            if not changed:
+                break
+        return np.array(pts, dtype=np.float64)
+
     def get_vid(pt):
         key = (float(pt[0]), float(pt[1]))
         if key in vertex_index:
@@ -213,6 +268,7 @@ def polygons_to_wireframe(polygons):
 
     for ring in polygons:
         ring = _clean_ring(ring)
+        ring = _simplify_ring_by_angle(ring, angle_eps_deg=3.0)
         # skip degenerate rings
         if ring.shape[0] < 3:
             continue
@@ -344,6 +400,95 @@ def merge_vertices_projected(vertices_proj, edges_idx, snap_to_int=True):
     new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
     return new_vertices, new_edges, idx_map
 
+def merge_vertices_eps(vertices_proj, edges_idx, eps_px=2.0):
+    """
+    Merge vertices whose projected XY are within eps_px distance.
+    Uses grid hashing + union-find to cluster, then averages cluster coordinates.
+    Returns (new_vertices, new_edges, idx_map).
+    """
+    verts = np.asarray(vertices_proj, dtype=np.float64)
+    edges = np.asarray(edges_idx, dtype=np.int32)
+    n = verts.shape[0]
+    if n == 0:
+        return verts, edges, np.arange(0)
+    # Build grid bins
+    gx = np.floor(verts[:, 0] / eps_px).astype(int)
+    gy = np.floor(verts[:, 1] / eps_px).astype(int)
+    bins = {}
+    for i, (bx, by) in enumerate(zip(gx, gy)):
+        bins.setdefault((bx, by), []).append(i)
+
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    eps2 = float(eps_px) * float(eps_px)
+    # Check within each bin and 8 neighbors
+    for (bx, by), idxs in bins.items():
+        neighbor_bins = [(bx+dx, by+dy) for dx in (-1,0,1) for dy in (-1,0,1)]
+        for nb in neighbor_bins:
+            cand = bins.get(nb)
+            if not cand:
+                continue
+            for i in idxs:
+                vi = verts[i, :2]
+                for j in cand:
+                    if j <= i:
+                        continue
+                    vj = verts[j, :2]
+                    if ((vi[0]-vj[0])**2 + (vi[1]-vj[1])**2) <= eps2:
+                        union(i, j)
+
+    # Build clusters
+    clusters = {}
+    for i in range(n):
+        r = find(i)
+        clusters.setdefault(r, []).append(i)
+
+    # Create new vertices as mean of cluster members (XY), Z as mean too
+    new_index = {}
+    new_vertices = []
+    for new_id, (root, members) in enumerate(clusters.items()):
+        pts = verts[members]
+        mean = pts.mean(axis=0)
+        new_vertices.append(mean.tolist())
+        for m in members:
+            new_index[m] = new_id
+
+    idx_map = np.array([new_index[i] for i in range(n)], dtype=np.int32)
+
+    # Remap edges, drop self-loops and duplicates
+    new_edges_set = set()
+    for e in edges:
+        a = int(idx_map[int(e[0])])
+        b = int(idx_map[int(e[1])])
+        if a == b:
+            continue
+        if a > b:
+            a, b = b, a
+        new_edges_set.add((a, b))
+
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
+    return new_vertices, new_edges, idx_map
+
 
 def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     with open(train_list_path, 'r') as f:
@@ -423,12 +568,6 @@ def visualize_image(image, data_dict, output_dir, index):
     cv2.imwrite(os.path.join(output_dir, f"{index}_vis.jpg"), image)
 
 def main():
-    # pc_dir = "xxx/pc"
-    # proj_dir = "xxx/rgb"
-    # npy_dir = "xxx/annot"
-    # train_list_path = "xxx/train_list.txt"
-    # test_list_path = "xxx/test_list.txt"
-    
     pc_dir = "./"
     proj_dir = "./training_data/rgb"
     npy_dir = "./training_data/annot"
@@ -486,12 +625,30 @@ def main():
             ring_xy = wf_vertices[np.array(idxs, dtype=np.int32), :2]
             rings_proj.append(ring_xy)
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
-        
-        
-         # Merge projected vertices that snap to the same pixel to avoid duplicates
-        wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
-        
-        
+
+        # Integrity counts before merge
+        v_before = int(wf_vertices.shape[0])
+        e_before = int(wf_edges.shape[0])
+
+        # Merge projected vertices that are within epsilon pixels to avoid duplicates
+        wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=2.0)
+
+        # Integrity counts after merge
+        v_after = int(wf_vertices.shape[0])
+        e_after = int(wf_edges.shape[0])
+
+        # Print and log integrity summary
+        try:
+            print(f"[integrity] {name}: V {v_before}->{v_after}, E {e_before}->{e_after}")
+            log_path = os.path.join(npy_dir, "integrity_log.csv")
+            if not os.path.exists(log_path):
+                with open(log_path, 'w', encoding='utf-8') as lf:
+                    lf.write("name,vertices_before,edges_before,vertices_after,edges_after\n")
+            with open(log_path, 'a', encoding='utf-8') as lf:
+                lf.write(f"{name},{v_before},{e_before},{v_after},{e_after}\n")
+        except Exception:
+            pass
+
         vertex_con = defaultdict(set)
 
         for edge in wf_edges:
@@ -518,7 +675,13 @@ def main():
             'annot': vertex_connections1,
             'point_labels': labels,
             'vertices_proj': wf_vertices,     # projected to 0..255 coords
-            'edges_idx': wf_edges            # 0-based indices into vertices_proj
+            'edges_idx': wf_edges,            # 0-based indices into vertices_proj
+            'integrity': {
+                'vertices_before_merge': v_before,
+                'edges_before_merge': e_before,
+                'vertices_after_merge': v_after,
+                'edges_after_merge': e_after,
+            },
         }
         
         np.save(npypath, combined)
@@ -606,6 +769,3 @@ def show_npy(file_path):
 if __name__ == '__main__':
     main()
         
-
-
-

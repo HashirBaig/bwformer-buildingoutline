@@ -489,6 +489,80 @@ def merge_vertices_eps(vertices_proj, edges_idx, eps_px=2.0):
     new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
     return new_vertices, new_edges, idx_map
 
+def collapse_short_edges(vertices_proj, edges_idx, min_len_px=4.0):
+    """
+    Collapse edges shorter than min_len_px by merging their endpoints (mean position).
+    Uses union-find across all short edges, then rebuilds the graph.
+    Returns (new_vertices, new_edges, idx_map)
+    """
+    V = np.asarray(vertices_proj, dtype=np.float64)
+    E = np.asarray(edges_idx, dtype=np.int32)
+    if V.size == 0 or E.size == 0:
+        return V, E, np.arange(V.shape[0], dtype=np.int32)
+    n = V.shape[0]
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    thr2 = float(min_len_px) * float(min_len_px)
+    for a, b in E:
+        a = int(a); b = int(b)
+        if a == b:
+            continue
+        dx = V[a, 0] - V[b, 0]
+        dy = V[a, 1] - V[b, 1]
+        if dx*dx + dy*dy <= thr2:
+            union(a, b)
+
+    # Build clusters and compute mean positions
+    clusters = {}
+    for i in range(n):
+        r = find(i)
+        clusters.setdefault(r, []).append(i)
+
+    new_index = {}
+    new_vertices = []
+    for new_id, (root, members) in enumerate(clusters.items()):
+        pts = V[members]
+        mean = pts.mean(axis=0)
+        new_vertices.append(mean.tolist())
+        for m in members:
+            new_index[m] = new_id
+
+    idx_map = np.array([new_index[i] for i in range(n)], dtype=np.int32)
+
+    # Remap edges, drop self-loops and duplicates
+    new_edges_set = set()
+    for e in E:
+        a = int(idx_map[int(e[0])])
+        b = int(idx_map[int(e[1])])
+        if a == b:
+            continue
+        if a > b:
+            a, b = b, a
+        new_edges_set.add((a, b))
+
+    new_vertices = np.array(new_vertices, dtype=np.float64)
+    new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
+    return new_vertices, new_edges, idx_map
+
 
 def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     with open(train_list_path, 'r') as f:
@@ -632,6 +706,8 @@ def main():
 
         # Merge projected vertices that are within epsilon pixels to avoid duplicates
         wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
+        # Collapse very short edges (tiny kinks near corners)
+        wf_vertices, wf_edges, _ = collapse_short_edges(wf_vertices, wf_edges, min_len_px=4.0)
         # Ensure any vertices falling on the same pixel are merged as well
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
 
@@ -740,6 +816,8 @@ def get_wireframe_overlay(NPY_PATH,IMG_PATH, OUT_PATH):
             V = np.concatenate([V, np.zeros((V.shape[0], 1), dtype=V.dtype)], axis=1)
         # Epsilon-based merge in overlay (robust against near duplicates)
         V, E, _ = merge_vertices_eps(V, E, eps_px=4.0)
+        # Collapse short edges in overlay too
+        V, E, _ = collapse_short_edges(V, E, min_len_px=4.0)
         px = np.rint(V[:, 0]).astype(int)
         py = np.rint(V[:, 1]).astype(int)
         key_to_new = {}

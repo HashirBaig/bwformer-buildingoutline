@@ -114,6 +114,193 @@ def load_wireframe(wireframe_file):
     edges = np.array(list(edges))
     return vertices, edges
 
+def load_polygons_json(polygon_file):
+    # JSON structure: { "polygons": [ [[x,y], [x,y], ...], ... ] }
+    with open(polygon_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    polys = data.get('polygons', [])
+    polygons = []
+    for ring in polys:
+        arr = np.array(ring, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+            raise ValueError(f"Invalid polygon ring in {polygon_file}: expected Nx2, got {arr.shape}")
+        polygons.append(arr)
+    return polygons
+
+def _load_geojson_polygons_from_obj(obj):
+    geom_type = obj.get('type', None)
+    polygons = []
+    if geom_type == 'FeatureCollection':
+        features = obj.get('features', [])
+        for feat in features:
+            geom = feat.get('geometry', {})
+            polygons.extend(_load_geojson_polygons_from_obj(geom))
+    elif geom_type == 'Feature':
+        geom = obj.get('geometry', {})
+        polygons.extend(_load_geojson_polygons_from_obj(geom))
+    elif geom_type == 'Polygon':
+        # coordinates: [ [outer], [hole1], ... ]; we assume no holes
+        coords = obj.get('coordinates', [])
+        if len(coords) > 0:
+            outer = np.array(coords[0], dtype=np.float64)
+            if outer.ndim == 2 and outer.shape[1] >= 2 and outer.shape[0] >= 3:
+                polygons.append(outer[:, :2])
+    elif geom_type == 'MultiPolygon':
+        # list of polygons; take each outer ring (index 0)
+        mcoords = obj.get('coordinates', [])
+        for poly in mcoords:
+            if len(poly) > 0:
+                outer = np.array(poly[0], dtype=np.float64)
+                if outer.ndim == 2 and outer.shape[1] >= 2 and outer.shape[0] >= 3:
+                    polygons.append(outer[:, :2])
+    else:
+        # Not a GeoJSON geometry container we recognize
+        pass
+    return polygons
+
+def load_geojson_polygons(geojson_file):
+    with open(geojson_file, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    return _load_geojson_polygons_from_obj(obj)
+
+def load_any_polygons(polygon_file):
+    """
+    Load polygons from either our simple JSON schema or a GeoJSON file.
+    Returns a list of (N_i x 2) arrays.
+    """
+    with open(polygon_file, 'r', encoding='utf-8') as f:
+        obj = json.load(f)
+    if isinstance(obj, dict) and 'polygons' in obj:
+        polys = obj.get('polygons', [])
+        polygons = []
+        for ring in polys:
+            arr = np.array(ring, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+                raise ValueError(f"Invalid polygon ring in {polygon_file}: expected Nx2, got {arr.shape}")
+            polygons.append(arr)
+        return polygons
+    else:
+        return _load_geojson_polygons_from_obj(obj)
+
+def polygons_to_wireframe(polygons):
+    # Deduplicate vertices across rings; build edges and ring index lists
+    vertex_index = {}
+    vertices = []
+    rings_idx = []
+    edges = set()
+
+    def get_vid(pt):
+        key = (float(pt[0]), float(pt[1]))
+        if key in vertex_index:
+            return vertex_index[key]
+        idx = len(vertices)
+        vertex_index[key] = idx
+        vertices.append([pt[0], pt[1], 0.0])
+        return idx
+
+    for ring in polygons:
+        idxs = [get_vid(pt) for pt in ring]
+        rings_idx.append(idxs)
+        n = len(idxs)
+        for i in range(n):
+            a = idxs[i]
+            b = idxs[(i + 1) % n]
+            if a == b:
+                continue
+            edges.add(tuple(sorted((a, b))))
+
+    vertices = np.array(vertices, dtype=np.float64)
+    edges = np.array(sorted(list(edges)), dtype=np.int32)
+    return vertices, edges, rings_idx
+
+def point_in_poly(point, ring):
+    # Ray casting; returns True if inside or on edge
+    x, y = float(point[0]), float(point[1])
+    inside = False
+    n = ring.shape[0]
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0 and dy == 0:
+            continue
+        t = ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)
+        if 0.0 <= t <= 1.0:
+            projx = x1 + t * dx
+            projy = y1 + t * dy
+            if abs(projx - x) <= 1e-6 and abs(projy - y) <= 1e-6:
+                return True
+        intersect = ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1)
+        if intersect:
+            inside = not inside
+    return inside
+
+def point_to_segment_distance(p, a, b):
+    ap = p - a
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom == 0.0:
+        return float(np.linalg.norm(ap))
+    t = float(np.dot(ap, ab)) / denom
+    t = max(0.0, min(1.0, t))
+    proj = a + t * ab
+    return float(np.linalg.norm(p - proj))
+
+def label_points_projected(points_xy, rings_proj, eps_px=1.5):
+    N = points_xy.shape[0]
+    inside = np.zeros(N, dtype=bool)
+    boundary = np.zeros(N, dtype=bool)
+    instance_id = np.full(N, -1, dtype=np.int32)
+
+    rings = [np.asarray(r, dtype=np.float64) for r in rings_proj]
+
+    for i in range(N):
+        p = points_xy[i]
+        for ridx, ring in enumerate(rings):
+            if point_in_poly(p, ring):
+                inside[i] = True
+                instance_id[i] = ridx
+                break
+        mind = np.inf
+        for ring in rings:
+            n = ring.shape[0]
+            for k in range(n):
+                a = ring[k]
+                b = ring[(k + 1) % n]
+                d = point_to_segment_distance(p, a, b)
+                if d < mind:
+                    mind = d
+            if mind <= eps_px:
+                break
+        if mind <= eps_px:
+            boundary[i] = True
+
+    return {
+        'inside': inside,
+        'boundary': boundary,
+        'instance_id': instance_id
+    }
+
+def build_polygon_files(train_list_path, test_list_path, poly_dir="xxx/poly"):
+    with open(train_list_path, 'r') as f:
+        train_names = [line.strip() for line in f if line.strip()]
+    with open(test_list_path, 'r') as f:
+        test_names = [line.strip() for line in f if line.strip()]
+    all_names = sorted(set(train_names + test_names))
+    files = []
+    for name in all_names:
+        p_geo = os.path.join(poly_dir, name + '.geojson')
+        p_json = os.path.join(poly_dir, name + '.json')
+        if os.path.exists(p_geo):
+            files.append(p_geo)
+        elif os.path.exists(p_json):
+            files.append(p_json)
+        else:
+            # default to .json path; will error later if missing
+            files.append(p_json)
+    return files
+
 def proj_img(pc, index, output_dir):
 
     x_pixels = np.floor(pc[:, 0]).astype(int)
@@ -175,6 +362,7 @@ def main():
     test_list_path = "xxx/test_list.txt"
     
     pc_files, wireframe_files = load_files(pc_dir, train_list_path, test_list_path)
+    polygon_files = build_polygon_files(train_list_path, test_list_path, poly_dir="xxx/poly")
     names = []
     annotations = []
     annotation_id = 0
@@ -192,10 +380,11 @@ def main():
     
         names.append(name)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
 
-        # ------------------------------- Wireframe ------------------------------
-        # load wireframe
-        wireframe_file = wireframe_files[index]
-        wf_vertices, wf_edges = load_wireframe(wireframe_file)
+        # ------------------------------- Polygons ------------------------------
+        # load polygons (no holes) from simple JSON or GeoJSON, then convert to wireframe
+        polygon_file = polygon_files[index]
+        polygons = load_any_polygons(polygon_file)
+        wf_vertices, wf_edges, rings_idx = polygons_to_wireframe(polygons)
 
         
         centroid = np.mean(point_cloud[:, 0:3], axis=0)
@@ -213,7 +402,15 @@ def main():
         wf_vertices /= (max_distance)
 
         wf_vertices = (wf_vertices +  np.ones_like(wf_vertices))  *  127.5
-     
+
+        # --------------------------- Per-point labeling ---------------------------
+        points_xy_proj = point_cloud[:, :2].copy()
+        rings_proj = []
+        for idxs in rings_idx:
+            ring_xy = wf_vertices[np.array(idxs, dtype=np.int32), :2]
+            rings_proj.append(ring_xy)
+        labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
+        
         vertex_con = {}
 
         for edge in wf_edges:
@@ -240,7 +437,11 @@ def main():
             for edge_vertex in edge:
                 vertex_connections1[tuple([wf_vertices[vertex][0], wf_vertices[vertex][1], wf_vertices[vertex][2]])].append(np.array([wf_vertices[edge_vertex][0], wf_vertices[edge_vertex][1], wf_vertices[edge_vertex][2]]))
         npypath = os.path.join(npy_dir, f"{name}.npy")
-        np.save(npypath, vertex_connections1)
+        combined = {
+            'annot': vertex_connections1,
+            'point_labels': labels
+        }
+        np.save(npypath, combined)
         image = proj_img(point_cloud, name, proj_dir)
         
 if __name__ == '__main__':

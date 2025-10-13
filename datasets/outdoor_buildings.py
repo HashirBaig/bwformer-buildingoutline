@@ -47,7 +47,18 @@ class OutdoorBuildingDataset(CornersDataset):
     def __getitem__(self, idx):
         data_name = self._data_names[idx][:-1]
         annot_path = os.path.join(self.data_path, 'annot', data_name + '.npy')
-        annot = np.load(annot_path, allow_pickle=True, encoding='latin1').tolist()
+        annot_raw = np.load(annot_path, allow_pickle=True, encoding='latin1')
+        try:
+            annot_obj = annot_raw.tolist()
+        except Exception:
+            annot_obj = annot_raw
+        # Support both legacy dict (corner->connections) and combined dict with keys {'annot', 'point_labels'}
+        if isinstance(annot_obj, dict) and 'annot' in annot_obj and isinstance(annot_obj['annot'], dict):
+            annot = annot_obj['annot']
+            # Optionally retain point labels if needed later
+            point_labels = annot_obj.get('point_labels', None)
+        else:
+            annot = annot_obj
         img_path = os.path.join(self.data_path, 'rgb', data_name + '.jpg')
         rgb = cv2.imread(img_path)
     

@@ -2,12 +2,13 @@ import os
 import sys
 import glob
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 import cv2
 import json
 import open3d as o3d
 from sklearn.linear_model import RANSACRegressor
 from sklearn.neighbors import NearestNeighbors
+
 def merge_adjacent_regions(labels, region_masks):
     region_areas = [np.sum(region_mask) for region_mask in region_masks]
 
@@ -83,19 +84,14 @@ def convert_annot(annot):
     return gt_data
 # load pc and wireframe
 def load_files(pc_dir, train_list_path, test_list_path):
-    wf_dir = "xxx/wf"
-
     with open(train_list_path, 'r') as f:
         train_names = [line.strip() for line in f if line.strip()]
-    with open(test_list_path, 'r') as f:
-        test_names = [line.strip() for line in f if line.strip()]
     
-    all_names = sorted(set(train_names + test_names))  # 合并并去重
+    all_names = sorted(set(train_names))  # 合并并去重
 
-    pc_files = [os.path.join(pc_dir, name + '.ply') for name in all_names]
-    wireframe_files = [os.path.join(wf_dir,  name + '.obj') for name in all_names]
+    pc_files = [name + '/points' + '.ply' for name in all_names]
 
-    return pc_files, wireframe_files
+    return pc_files
 
 def load_wireframe(wireframe_file):
     vertices = []
@@ -118,7 +114,10 @@ def load_polygons_json(polygon_file):
     # JSON structure: { "polygons": [ [[x,y], [x,y], ...], ... ] }
     with open(polygon_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
+    
+    print('poly_data: ', data)
     polys = data.get('polygons', [])
+    print('polys_data: ', polys)
     polygons = []
     for ring in polys:
         arr = np.array(ring, dtype=np.float64)
@@ -188,7 +187,7 @@ def polygons_to_wireframe(polygons):
     vertices = []
     rings_idx = []
     edges = set()
-
+    
     def _clean_ring(ring_arr):
         # Remove repeated closing point and consecutive duplicates
         ring = np.asarray(ring_arr, dtype=np.float64)
@@ -300,6 +299,7 @@ def label_points_projected(points_xy, rings_proj, eps_px=1.5):
         'instance_id': instance_id
     }
 
+
 def merge_vertices_projected(vertices_proj, edges_idx, snap_to_int=True):
     """
     Merge projected vertices that land on the same pixel (after optional rounding),
@@ -344,16 +344,22 @@ def merge_vertices_projected(vertices_proj, edges_idx, snap_to_int=True):
     new_edges = np.array(sorted(list(new_edges_set)), dtype=np.int32) if len(new_edges_set) > 0 else np.zeros((0,2), dtype=np.int32)
     return new_vertices, new_edges, idx_map
 
-def build_polygon_files(train_list_path, test_list_path, poly_dir="xxx/poly"):
+
+def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     with open(train_list_path, 'r') as f:
         train_names = [line.strip() for line in f if line.strip()]
-    with open(test_list_path, 'r') as f:
-        test_names = [line.strip() for line in f if line.strip()]
-    all_names = sorted(set(train_names + test_names))
+    # with open(test_list_path, 'r') as f:
+    #     test_names = [line.strip() for line in f if line.strip()]
+    all_names = sorted(set(train_names))
+    
+    
+    
     files = []
     for name in all_names:
-        p_geo = os.path.join(poly_dir, name + '.geojson')
-        p_json = os.path.join(poly_dir, name + '.json')
+        p_geo = name + '/polygon' + '.geojson'
+        p_json = name + '/polygon' + '.json'
+        
+        print(p_geo)
         if os.path.exists(p_geo):
             files.append(p_geo)
         elif os.path.exists(p_json):
@@ -417,32 +423,40 @@ def visualize_image(image, data_dict, output_dir, index):
     cv2.imwrite(os.path.join(output_dir, f"{index}_vis.jpg"), image)
 
 def main():
-    pc_dir = "xxx/pc"
-    proj_dir = "xxx/rgb"
-    npy_dir = "xxx/annot"
-    train_list_path = "xxx/train_list.txt"
+    # pc_dir = "xxx/pc"
+    # proj_dir = "xxx/rgb"
+    # npy_dir = "xxx/annot"
+    # train_list_path = "xxx/train_list.txt"
+    # test_list_path = "xxx/test_list.txt"
+    
+    pc_dir = "./"
+    proj_dir = "./training_data/rgb"
+    npy_dir = "./training_data/annot"
+    train_list_path = "./train_list.txt"
     test_list_path = "xxx/test_list.txt"
     
-    pc_files, wireframe_files = load_files(pc_dir, train_list_path, test_list_path)
-    polygon_files = build_polygon_files(train_list_path, test_list_path, poly_dir="xxx/poly")
+    pc_files = load_files(pc_dir, train_list_path, test_list_path)
+    polygon_files = build_polygon_files(train_list_path, test_list_path, poly_dir="./")
+    
     names = []
     annotations = []
     annotation_id = 0
     images = []
     image_id = 0
 
-    for index in range(len(pc_files)):
-        print(index)
+    for index, path in enumerate(pc_files):
+        base_path = path[:-10]
+        print('idx: ',index,' - path: ', base_path)
         image_id = image_id + 1
         pc_file = pc_files[index]
         pcd = o3d.io.read_point_cloud(pc_file)  # 读取 .ply 文件
         point_cloud = np.asarray(pcd.points) 
         name =  os.path.splitext(os.path.basename(pc_file))[0]
-        print(name)
+        print('point cloud name >> ',name)
     
         names.append(name)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
 
-        # ------------------------------- Polygons ------------------------------
+         # ------------------------------- Polygons ------------------------------
         # load polygons (no holes) from simple JSON or GeoJSON, then convert to wireframe
         polygon_file = polygon_files[index]
         polygons = load_any_polygons(polygon_file)
@@ -472,9 +486,11 @@ def main():
             ring_xy = wf_vertices[np.array(idxs, dtype=np.int32), :2]
             rings_proj.append(ring_xy)
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
-
-        # Merge projected vertices that snap to the same pixel to avoid duplicates
+        
+        
+         # Merge projected vertices that snap to the same pixel to avoid duplicates
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
+        
         
         vertex_con = defaultdict(set)
 
@@ -497,15 +513,95 @@ def main():
                     wf_vertices[edge_vertex][1],
                     wf_vertices[edge_vertex][2]
                 ]))
-        npypath = os.path.join(npy_dir, f"{name}.npy")
+        npypath = base_path + f"{name}.npy"
         combined = {
             'annot': vertex_connections1,
             'point_labels': labels,
             'vertices_proj': wf_vertices,     # projected to 0..255 coords
             'edges_idx': wf_edges            # 0-based indices into vertices_proj
         }
+        
         np.save(npypath, combined)
-        image = proj_img(point_cloud, name, proj_dir)
+        # show_npy(npypath)
+        image = proj_img(point_cloud, name, base_path)
+        
+         # -------------------- Configuration --------------------
+        IMG_PATH = base_path + f"{name}.jpg"       # top-down point cloud / height image
+        OUT_PATH = base_path +  "wireframe_overlay.png" # where overlay will be saved
+        # -------------------------------------------------------
+
+        get_wireframe_overlay(npypath,IMG_PATH, OUT_PATH)
+         
+def get_wireframe_overlay(NPY_PATH,IMG_PATH, OUT_PATH):
+    def collect_graph(annot_dict):
+        """Convert adjacency dictionary into vertex/edge arrays."""
+        verts = set()
+        edges = set()
+        for k, neighs in annot_dict.items():
+            # ensure tuple of 3 floats
+            if isinstance(k, (list, np.ndarray)):
+                k = tuple(map(float, k))
+            else:
+                k = tuple(k)
+            verts.add(k)
+            for n in neighs:
+                n = tuple(map(float, n))
+                verts.add(n)
+                a, b = k, n
+                edges.add(tuple(sorted((a, b))))
+        verts = list(verts)
+        idx = {v: i for i, v in enumerate(verts)}
+        E = [(idx[a], idx[b]) for (a, b) in edges if idx[a] != idx[b]]
+        return np.array(verts, dtype=float), np.array(E, dtype=int)
+
+    # -------------------- Load data --------------------
+    obj = np.load(NPY_PATH, allow_pickle=True).item()
+    if isinstance(obj, dict) and "annot" in obj:
+        annot = obj["annot"]
+    else:
+        annot = obj
+
+    V, E = collect_graph(annot)
+
+    img = cv2.imread(IMG_PATH, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {IMG_PATH}")
+    H, W = img.shape[:2]
+
+    # -------------------- Overlay drawing --------------------
+    overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    def in_img(pt):
+        return 0 <= pt[0] < W and 0 <= pt[1] < H
+
+    # Draw edges
+    for (a, b) in E:
+        pa = (int(round(V[a, 0])), int(round(V[a, 1])))
+        pb = (int(round(V[b, 0])), int(round(V[b, 1])))
+        if in_img(pa) and in_img(pb):
+            cv2.line(overlay, pa, pb, (255, 255, 255), 1)
+
+    # Draw vertices
+    for i in range(len(V)):
+        p = (int(round(V[i, 0])), int(round(V[i, 1])))
+        if in_img(p):
+            cv2.circle(overlay, p, 2, (255, 255, 255), -1)
+
+    cv2.imwrite(OUT_PATH, overlay)
+    print(f"[✓] Overlay saved to: {OUT_PATH}")
+    print(f"Vertices: {len(V)} | Edges: {len(E)} | Image size: {H}×{W}")
+
+
+def show_npy(file_path):
+    # Load the uploaded npy file again
+    data = np.load(file_path, allow_pickle=True).item()
+
+    # Extract number of vertices and edges
+    num_vertices = len(data)
+    edge_count = sum(len(v) for v in data.values()) // 2  # divide by 2 to avoid double counting
+
+    print('no. of vertices: ',num_vertices,' - no of edges: ', edge_count)
+
         
 if __name__ == '__main__':
     main()

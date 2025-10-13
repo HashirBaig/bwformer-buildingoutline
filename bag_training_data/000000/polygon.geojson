@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "b1_gjsn",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::28992" } },
+"features": [
+{ "type": "Feature", "properties": { "feature_id": 8532282.0, "rdf_seeals": "http://bag.basisregistraties.overheid.nl/bag/id/pand/0153100000254392", "identifica": "0153100000254392", "bouwjaar": 2007.0, "status": "Pand in gebruik", "gebruiksdo": "overige gebruiksfunctie", "oppervlakt": 5560.0, "oppervla_1": 5560.0, "aantal_ver": 1.0 }, "geometry": { "type": "MultiPolygon", "coordinates": [ [ [ [ 257722.207, 471183.868000000016764 ], [ 257716.942000000010012, 471172.348999999987427 ], [ 257709.768000000010943, 471156.650000000023283 ], [ 257665.557999999989988, 471176.900000000023283 ], [ 257672.089, 471191.177000000025146 ], [ 257673.337, 471193.90500000002794 ], [ 257679.268000000010943, 471206.87 ], [ 257719.878, 471188.297000000020489 ], [ 257723.478, 471186.650000000023283 ], [ 257722.207, 471183.868000000016764 ] ] ] ] } }
+]
+}

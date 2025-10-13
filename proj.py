@@ -631,7 +631,9 @@ def main():
         e_before = int(wf_edges.shape[0])
 
         # Merge projected vertices that are within epsilon pixels to avoid duplicates
-        wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=2.0)
+        wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
+        # Ensure any vertices falling on the same pixel are merged as well
+        wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
 
         # Integrity counts after merge
         v_after = int(wf_vertices.shape[0])
@@ -719,12 +721,48 @@ def get_wireframe_overlay(NPY_PATH,IMG_PATH, OUT_PATH):
 
     # -------------------- Load data --------------------
     obj = np.load(NPY_PATH, allow_pickle=True).item()
-    if isinstance(obj, dict) and "annot" in obj:
-        annot = obj["annot"]
+    V = None
+    E = None
+    if isinstance(obj, dict) and 'vertices_proj' in obj and 'edges_idx' in obj:
+        V = np.asarray(obj['vertices_proj'], dtype=float)
+        E = np.asarray(obj['edges_idx'], dtype=int)
     else:
-        annot = obj
+        if isinstance(obj, dict) and "annot" in obj:
+            annot = obj["annot"]
+        else:
+            annot = obj
+        V, E = collect_graph(annot)
 
-    V, E = collect_graph(annot)
+    # Final dedup for overlay: first epsilon-cluster in pixel space, then collapse by rounding
+    if V is not None and V.size > 0:
+        # Ensure V has z column
+        if V.shape[1] == 2:
+            V = np.concatenate([V, np.zeros((V.shape[0], 1), dtype=V.dtype)], axis=1)
+        # Epsilon-based merge in overlay (robust against near duplicates)
+        V, E, _ = merge_vertices_eps(V, E, eps_px=4.0)
+        px = np.rint(V[:, 0]).astype(int)
+        py = np.rint(V[:, 1]).astype(int)
+        key_to_new = {}
+        new_V = []
+        for i, (x, y) in enumerate(zip(px, py)):
+            key = (int(x), int(y))
+            if key not in key_to_new:
+                key_to_new[key] = len(new_V)
+                # keep Z if present, else 0
+                z = V[i, 2] if V.shape[1] >= 3 else 0.0
+                new_V.append([x, y, z])
+        idx_map = np.array([key_to_new[(int(x), int(y))] for x, y in zip(px, py)], dtype=int)
+        new_edges = set()
+        for a, b in E:
+            a2 = int(idx_map[int(a)])
+            b2 = int(idx_map[int(b)])
+            if a2 == b2:
+                continue
+            if a2 > b2:
+                a2, b2 = b2, a2
+            new_edges.add((a2, b2))
+        V = np.array(new_V, dtype=float)
+        E = np.array(sorted(list(new_edges)), dtype=int) if len(new_edges) > 0 else np.zeros((0,2), dtype=int)
 
     img = cv2.imread(IMG_PATH, cv2.IMREAD_GRAYSCALE)
     if img is None:

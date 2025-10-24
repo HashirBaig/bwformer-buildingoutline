@@ -939,24 +939,31 @@ def build_polygon_files(train_list_path, test_list_path, poly_dir="./"):
     return files
 
 def proj_img(pc, index, output_dir):
+    """
+    Rasterize a max-height (roof) image from the point cloud.
+    Assumes pc[:,0:3] are already normalized to [0,255] in proj.py.
+    """
+    H = W = 256
+    image = np.zeros((H, W, 3), dtype=np.uint8)
 
+    # pixel coords
     x_pixels = np.floor(pc[:, 0]).astype(int)
     y_pixels = np.floor(pc[:, 1]).astype(int)
 
+    # clip to bounds
+    x_pixels = np.clip(x_pixels, 0, W - 1)
+    y_pixels = np.clip(y_pixels, 0, H - 1)
 
-    image = np.zeros((256, 256, 3), dtype=np.uint8)
-
-
+    # iterate and keep the **maximum** z per pixel (roof DSM)
     for i in range(len(pc)):
-        if image[y_pixels[i], x_pixels[i]][0] == 0:
-            image[y_pixels[i], x_pixels[i]] = [pc[i, 2], pc[i, 2], pc[i, 2]]
-        else:
-            if pc[i, 2] < image[y_pixels[i], x_pixels[i]][0]:
-                image[y_pixels[i], x_pixels[i]] = [pc[i, 2], pc[i, 2], pc[i, 2]]
-
+        y, x = y_pixels[i], x_pixels[i]
+        z = int(round(pc[i, 2]))          # z is already in 0..255 after your normalization
+        if z > image[y, x, 0]:             # compare with current stored height
+            image[y, x] = (z, z, z)
 
     cv2.imwrite(os.path.join(output_dir, f"{index}.jpg"), image)
     return image
+
 
 def proj_maskimg(pc, index, output_dir):
 

@@ -81,84 +81,65 @@ def _largest_contour_intersecting_bag(bin_img, bag_mask):
                 best, best_area = c, area
     return best
 
-def wireframe_from_pointcloud(pc_xyz_255, bag_rings_proj, d_k=3, dilate=1, close=3):
+def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
     """
-    Build vertices/edges from POINT CLOUD under BAG guidance.
-    Inputs:
-      pc_xyz_255: (N,3) in your 0..255 normalized frame
-      bag_rings_proj: list of rings in 0..255 frame (same canvas as your jpg)
-    Returns:
-      vertices_proj (V,3)  in 0..255 frame, edges_idx (E,2).
+    Build vertices/edges from POINT CLOUD under BAG guidance in the XY canvas (0..255).
+    pc_xyz_255: (N,3) already normalized to 0..255
+    rings_proj: list of BAG rings already mapped to the same 0..255 XY canvas
     """
-    # 1) Fit dominant plane on (x,y,z) in 0..255 frame
+    import numpy as np, cv2
+
+    # 1) Fit dominant plane to get roof inliers (for denoising only)
     (a,b,c,d), inliers = _fit_roof_plane_o3d(pc_xyz_255, dist_thresh=1.0, ransac_n=3, num_iters=2000)
-    roof = pc_xyz_255[inliers]  # (M,3)
+    roof = pc_xyz_255[inliers] if len(inliers) > 0 else pc_xyz_255
 
-    # 2) Project to plane (u,v), then normalize to canvas 0..255
-    uv, (u_axis,v_axis,n_axis,X0) = _project_points_to_plane_uv(roof, a,b,c,d)
-    uv_canvas, T_uv2canvas = _normalize_uv_to_canvas(uv, pad=8, size=256)
+    # 2) Work DIRECTLY in XY canvas
+    pts_canvas = roof[:, :2]                     # (M,2) in 0..255 XY
+    H = W = 256
 
-    # 3) BAG guidance: project BAG XY rings directly with the same T_uv2canvas (Option A restored)
-    bag_rings_canvas = []
-    for ring_xy in bag_rings_proj:
-        ring_xy1 = np.c_[ring_xy[:, :2], np.ones(len(ring_xy))]
-        ring_canvas = (ring_xy1 @ T_uv2canvas.T)[:, :2]
-        bag_rings_canvas.append(ring_canvas)
-
-
-
-    # 4) Keep only points inside BAG mask (safety)
-    pts_canvas = uv_canvas  # (M,2)
-    H=W=256
-    bag_mask = np.zeros((H,W), np.uint8)
-    for ring in bag_rings_canvas:
+    # BAG mask in XY canvas
+    bag_mask = np.zeros((H, W), np.uint8)
+    for ring in rings_proj:
         cv2.fillPoly(bag_mask, [np.rint(ring).astype(np.int32)], 1)
-    px = np.clip(np.rint(pts_canvas[:,0]).astype(int), 0, W-1)
-    py = np.clip(np.rint(pts_canvas[:,1]).astype(int), 0, H-1)
-    keep = bag_mask[py, px] > 0
-    pts_canvas = pts_canvas[keep]
-    roof_kept = roof[keep]
 
-    if len(pts_canvas) < 20:
-        # fallback: use all inliers (rare)
-        pts_canvas = uv_canvas
+    # Keep only points inside BAG (safety)
+    px = np.clip(np.rint(pts_canvas[:, 0]).astype(int), 0, W-1)
+    py = np.clip(np.rint(pts_canvas[:, 1]).astype(int), 0, H-1)
+    keep = (bag_mask[py, px] > 0)
+    if keep.any():
+        pts_canvas = pts_canvas[keep]
+        roof_kept = roof[keep]
+    else:
         roof_kept = roof
 
-    # 5) Rasterize occupancy + morphology; get largest contour intersecting BAG
-    occ = np.zeros((H,W), np.uint8)
-    px = np.clip(np.rint(pts_canvas[:,0]).astype(int), 0, W-1)
-    py = np.clip(np.rint(pts_canvas[:,1]).astype(int), 0, H-1)
+    # 3) Rasterize occupancy and get largest contour intersecting BAG
+    occ = np.zeros((H, W), np.uint8)
+    px = np.clip(np.rint(pts_canvas[:, 0]).astype(int), 0, W-1)
+    py = np.clip(np.rint(pts_canvas[:, 1]).astype(int), 0, H-1)
     occ[py, px] = 255
-    if dilate>0: occ = cv2.dilate(occ, np.ones((dilate,dilate), np.uint8))
-    if close>0:  occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((close,close), np.uint8))
+    if dilate > 0: occ = cv2.dilate(occ, np.ones((dilate, d_k), np.uint8))
+    if close  > 0: occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
 
     contour = _largest_contour_intersecting_bag(occ, bag_mask)
     if contour is None or len(contour) < 3:
-        # fallback to convex hull of points
         hull = cv2.convexHull(np.rint(pts_canvas).astype(np.int32))
         contour = hull
 
-    # 6) Simplify contour -> polygon in canvas; sample uniformly
-    poly = contour[:,0,:].astype(np.float64)  # (K,2)
-    poly = _rdp(poly, eps=2.5)                # reuse your RDP
+    # 4) Simplify -> polygon in XY canvas
+    poly = contour[:, 0, :].astype(np.float64)   # (K,2)
+    poly = _rdp(poly, eps=2.5)
     poly = _dedupe_ring_pixels(poly, px_eps=1.0)
     if len(poly) < 3:
         raise RuntimeError("Contour too small after simplification")
 
-    # 7) Build vertices (with Z) and edges as ring, then OPTIONAL merges (reusing your helpers)
-    z_mean = float(np.median(roof_kept[:,2]))  # or per-vertex z by nearest neighbor
-    vertices_canvas = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]  # (V,3)
-    edges = []
-    V = len(vertices_canvas)
-    for i in range(V):
-        edges.append([i, (i+1)%V])
-    vertices_canvas, edges, _ = merge_vertices_projected(vertices_canvas, np.array(edges, dtype=np.int32), snap_to_int=True)
+    # 5) Build vertices (with Z) and edges (ring), then light cleanup
+    z_mean = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+    vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
+    edges = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
 
-    # 8) Return in the original 0..255 **image XY** frame (canvas is already 0..255)
-    vertices_proj = vertices_canvas.astype(np.float64)
-    edges_idx = edges.astype(np.int32)
-    return vertices_proj, edges_idx
+    vertices, edges, _ = merge_vertices_projected(vertices, edges, snap_to_int=True)
 
+    return vertices.astype(np.float64), edges.astype(np.int32)
 
 
 def merge_adjacent_regions(labels, region_masks):

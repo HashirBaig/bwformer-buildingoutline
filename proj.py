@@ -1191,22 +1191,32 @@ def main():
         centroid = np.mean(point_cloud[:, :3], axis=0)
         point_cloud[:, :3] -= centroid
 
-        r = np.linalg.norm(point_cloud[:, :3], axis=1)
-        max_distance = np.percentile(r, 99.5)  # instead of max()
-
+        r = np.linalg.norm(point_cloud[:, :2], axis=1)  # only XY for normalization
+        max_distance = np.percentile(r, 99.5)
 
                 
-        point_cloud[:, 0:3] /= (max_distance)
-        point_cloud[:, :3] = (point_cloud[:, :3] + 1.0) * 127.5
+        PAD_SCALE = 0.90  # ~5% margin on each side
+
+        # XY scaled with padding (to stay inside 256×256)
+        point_cloud[:, :2] = (point_cloud[:, :2] / max(max_distance, 1e-6)) * (127.5 * PAD_SCALE)
+
+        # Robust Z scaling (optional; for visualization/height channel only)
+        z99 = np.percentile(point_cloud[:, 2], 99.5)
+        point_cloud[:, 2] = (point_cloud[:, 2] / max(z99, 1e-6)) * 127.5
+
+        # Shift to 0..255 canvas and clip
+        point_cloud[:, :3] = point_cloud[:, :3] + 127.5
+        point_cloud[:, :3] = np.clip(point_cloud[:, :3], 0, 255)
+
 
 
         rings_proj = []
         for ring in polygons:
-            ring = ring - centroid[:2]           # center like points (XY)
-            ring = (ring / max_distance)         # scale to unit
-            ring = (ring + 1.0) * 127.5          # 0..255
+            ring = ring - centroid[:2]
+            ring = (ring / max(max_distance, 1e-6)) * (127.5 * PAD_SCALE)
+            ring = ring + 127.5
+            ring = np.clip(ring, 0, 255)
             rings_proj.append(ring)
-
 
         # Per-point labeling (projected pixel frame)
         points_xy_proj = point_cloud[:, :2].copy()              # (N,2) in 0..255 frame

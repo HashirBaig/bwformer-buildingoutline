@@ -1,13 +1,163 @@
 import os
 import sys
 import glob
-import numpy as np
+import numpy as np, cv2
 from collections import defaultdict, deque
-import cv2
 import json
 import open3d as o3d
 from sklearn.linear_model import RANSACRegressor
 from sklearn.neighbors import NearestNeighbors
+
+def _fit_roof_plane_o3d(pc_xyz, dist_thresh=0.02, ransac_n=3, num_iters=2000):
+    """Fit dominant roof plane on normalized points (0..255) using Open3D RANSAC."""
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc_xyz.astype(np.float64))
+    plane_model, inliers = pcd.segment_plane(distance_threshold=dist_thresh,
+                                             ransac_n=ransac_n,
+                                             num_iterations=num_iters)
+    a,b,c,d = plane_model  # ax+by+cz+d=0
+    inliers = np.asarray(inliers, dtype=np.int64)
+    return (a,b,c,d), inliers
+
+def _orthonormal_frame_from_plane(a,b,c):
+    """Build (u,v,n) basis given plane normal n=[a,b,c]."""
+    n = np.array([a,b,c], dtype=np.float64)
+    n /= (np.linalg.norm(n) + 1e-12)
+    # choose a vector not parallel to n
+    h = np.array([1.0,0.0,0.0]) if abs(n[0]) < 0.9 else np.array([0.0,1.0,0.0])
+    u = np.cross(n, h); u /= (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u); v /= (np.linalg.norm(v) + 1e-12)
+    return u, v, n
+
+def _project_points_to_plane_uv(pc_xyz, a,b,c,d):
+    """Project points to plane coordinate system -> (u,v) in 2D."""
+    u,v,n = _orthonormal_frame_from_plane(a,b,c)
+    # choose an origin on plane: n·X0 + d = 0 -> X0 = -d*n
+    X0 = -d * n
+    # vector from origin to each point
+    q = pc_xyz - X0[None,:]
+    U = q @ u  # (N,)
+    V = q @ v  # (N,)
+    return np.stack([U,V], axis=1), (u,v,n,X0)
+
+def _normalize_uv_to_canvas(uv, pad=8, size=256):
+    """Affine normalize uv coords to 0..(size-1), keeping aspect."""
+    umin,vmin = uv.min(0); umax,vmax = uv.max(0)
+    du = max(umax-umin, 1e-6); dv = max(vmax-vmin, 1e-6)
+    s = (size - 2*pad) / max(du, dv)
+    T = np.array([ [s, 0, -(umin*s) + pad],
+                   [0, s, -(vmin*s) + pad],
+                   [0, 0, 1] ], dtype=np.float64)
+    uv1 = np.c_[uv, np.ones(len(uv))] @ T.T
+    return uv1[:,:2], T  # canvas coords (float), 3x3 affine
+
+def _mask_by_bag_polygon_xy(pc_xy_canvas, bag_rings_canvas):
+    """Keep points whose (x,y) in ANY BAG ring (in canvas coordinates)."""
+    mask = np.zeros(len(pc_xy_canvas), dtype=bool)
+    for ring in bag_rings_canvas:
+        cnt = ring.astype(np.float32)[None,:,:]  # (1,N,2)
+        inside = cv2.pointPolygonTest(cnt[0], (0,0), False)  # dummy call to warm-up
+        # vectorized test via rasterization
+        H=W=256
+        poly = np.rint(ring).astype(np.int32)[None,:,:]
+        roi = np.zeros((H,W), np.uint8); cv2.fillPoly(roi, poly, 1)
+        px = np.clip(np.rint(pc_xy_canvas[:,0]).astype(int), 0, W-1)
+        py = np.clip(np.rint(pc_xy_canvas[:,1]).astype(int), 0, H-1)
+        mask |= (roi[py, px] > 0)
+    return mask
+
+def _largest_contour_intersecting_bag(bin_img, bag_mask):
+    """Return largest contour that has positive intersection with BAG mask."""
+    contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    best = None; best_area = 0
+    for c in contours:
+        area = abs(cv2.contourArea(c))
+        if area <= 10:  # ignore tiny blobs
+            continue
+        test = np.zeros_like(bin_img); cv2.drawContours(test, [c], -1, 1, -1)
+        if (test & bag_mask).any():
+            if area > best_area:
+                best, best_area = c, area
+    return best
+
+def wireframe_from_pointcloud(pc_xyz_255, bag_rings_proj, d_k=3, dilate=1, close=3):
+    """
+    Build vertices/edges from POINT CLOUD under BAG guidance.
+    Inputs:
+      pc_xyz_255: (N,3) in your 0..255 normalized frame
+      bag_rings_proj: list of rings in 0..255 frame (same canvas as your jpg)
+    Returns:
+      vertices_proj (V,3)  in 0..255 frame, edges_idx (E,2).
+    """
+    # 1) Fit dominant plane on (x,y,z) in 0..255 frame
+    (a,b,c,d), inliers = _fit_roof_plane_o3d(pc_xyz_255, dist_thresh=1.0, ransac_n=3, num_iters=2000)
+    roof = pc_xyz_255[inliers]  # (M,3)
+
+    # 2) Project to plane (u,v), then normalize to canvas 0..255
+    uv, (u_axis,v_axis,n_axis,X0) = _project_points_to_plane_uv(roof, a,b,c,d)
+    uv_canvas, T_uv2canvas = _normalize_uv_to_canvas(uv, pad=8, size=256)
+
+    # 3) BAG guidance: bring BAG rings into the same canvas via T applied to original XY
+    bag_rings_canvas = []
+    for ring in bag_rings_proj:
+        ring_xy1 = np.c_[ring[:,:2], np.ones(len(ring))]
+        ring_canvas = (ring_xy1 @ T_uv2canvas.T)[:,:2]
+        bag_rings_canvas.append(ring_canvas)
+
+    # 4) Keep only points inside BAG mask (safety)
+    pts_canvas = uv_canvas  # (M,2)
+    H=W=256
+    bag_mask = np.zeros((H,W), np.uint8)
+    for ring in bag_rings_canvas:
+        cv2.fillPoly(bag_mask, [np.rint(ring).astype(np.int32)], 1)
+    px = np.clip(np.rint(pts_canvas[:,0]).astype(int), 0, W-1)
+    py = np.clip(np.rint(pts_canvas[:,1]).astype(int), 0, H-1)
+    keep = bag_mask[py, px] > 0
+    pts_canvas = pts_canvas[keep]
+    roof_kept = roof[keep]
+
+    if len(pts_canvas) < 20:
+        # fallback: use all inliers (rare)
+        pts_canvas = uv_canvas
+        roof_kept = roof
+
+    # 5) Rasterize occupancy + morphology; get largest contour intersecting BAG
+    occ = np.zeros((H,W), np.uint8)
+    px = np.clip(np.rint(pts_canvas[:,0]).astype(int), 0, W-1)
+    py = np.clip(np.rint(pts_canvas[:,1]).astype(int), 0, H-1)
+    occ[py, px] = 255
+    if dilate>0: occ = cv2.dilate(occ, np.ones((dilate,dilate), np.uint8))
+    if close>0:  occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((close,close), np.uint8))
+
+    contour = _largest_contour_intersecting_bag(occ, bag_mask)
+    if contour is None or len(contour) < 3:
+        # fallback to convex hull of points
+        hull = cv2.convexHull(np.rint(pts_canvas).astype(np.int32))
+        contour = hull
+
+    # 6) Simplify contour -> polygon in canvas; sample uniformly
+    poly = contour[:,0,:].astype(np.float64)  # (K,2)
+    poly = _rdp(poly, eps=2.5)                # reuse your RDP
+    poly = _dedupe_ring_pixels(poly, px_eps=1.0)
+    if len(poly) < 3:
+        raise RuntimeError("Contour too small after simplification")
+
+    # 7) Build vertices (with Z) and edges as ring, then OPTIONAL merges (reusing your helpers)
+    z_mean = float(np.median(roof_kept[:,2]))  # or per-vertex z by nearest neighbor
+    vertices_canvas = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]  # (V,3)
+    edges = []
+    V = len(vertices_canvas)
+    for i in range(V):
+        edges.append([i, (i+1)%V])
+    vertices_canvas, edges, _ = merge_vertices_projected(vertices_canvas, np.array(edges, dtype=np.int32), snap_to_int=True)
+
+    # 8) Return in the original 0..255 **image XY** frame (canvas is already 0..255)
+    vertices_proj = vertices_canvas.astype(np.float64)
+    edges_idx = edges.astype(np.int32)
+    return vertices_proj, edges_idx
+
+
 
 def merge_adjacent_regions(labels, region_masks):
     region_areas = [np.sum(region_mask) for region_mask in region_masks]
@@ -1028,90 +1178,68 @@ def main():
         # ------------------------------- Polygons ------------------------------
         # load polygons (no holes) from simple JSON or GeoJSON, then convert to wireframe
         polygon_file = polygon_files[index]
-        polygons = load_any_polygons(polygon_file)
-        wf_vertices, wf_edges, rings_idx = polygons_to_wireframe(polygons)
-
         
-        centroid = np.mean(point_cloud[:, 0:3], axis=0)
-        point_cloud[:, 0:3] -= centroid
-        wf_vertices -= centroid
-        max_distance = np.max(np.linalg.norm(np.vstack((point_cloud[:, 0:3], wf_vertices)), axis=1))
+        # 1) Load BAG polygon (only for guidance)
+        polygons = load_any_polygons(polygon_file)          # list of rings in world/image XY
+        # bring to projected frame you already use (0..255); in your code wf_vertices later get normalized
+        # We first normalize point_cloud to 0..255 as you already do (centroid/max_distance code).
+        # After you compute:
+        #   centroid / max_distance
+        #   point_cloud[:,0:3] -> normalized to 0..255  (as in your script)
+        # then map BAG rings the same way:
+
+        centroid = np.mean(point_cloud[:, :3], axis=0)
+        point_cloud[:, :3] -= centroid
+
+        r = np.linalg.norm(point_cloud[:, :3], axis=1)
+        max_distance = np.percentile(r, 99.5)  # instead of max()
+
 
                 
         point_cloud[:, 0:3] /= (max_distance)
-        point_cloud[:, 0:3] = (point_cloud[:, 0:3] +  np.ones_like(point_cloud[:, 0:3]))  * 127.5
+        point_cloud[:, :3] = (point_cloud[:, :3] + 1.0) * 127.5
 
-        o3d_pc = o3d.geometry.PointCloud()
-        o3d_pc.points = o3d.utility.Vector3dVector(point_cloud)
 
-        wf_vertices /= (max_distance)
-
-        wf_vertices = (wf_vertices +  np.ones_like(wf_vertices))  *  127.5
-
-        # --------------------------- Per-point labeling ---------------------------
-        points_xy_proj = point_cloud[:, :2].copy()
         rings_proj = []
-        for idxs in rings_idx:
-            ring_xy = wf_vertices[np.array(idxs, dtype=np.int32), :2]
-            rings_proj.append(ring_xy)
+        for ring in polygons:
+            ring = ring - centroid[:2]           # center like points (XY)
+            ring = (ring / max_distance)         # scale to unit
+            ring = (ring + 1.0) * 127.5          # 0..255
+            rings_proj.append(ring)
+
+
+        # Per-point labeling (projected pixel frame)
+        points_xy_proj = point_cloud[:, :2].copy()              # (N,2) in 0..255 frame
         labels = label_points_projected(points_xy_proj, rings_proj, eps_px=1.5)
 
-        # Integrity counts before projected simplification/merge
-        v_before = int(wf_vertices.shape[0])
-        e_before = int(wf_edges.shape[0])
 
-        # Simplify rings in projected pixel space and rebuild wireframe
-        wf_vertices, wf_edges, rings_idx = simplify_and_rebuild_from_projected_rings(
-            wf_vertices, rings_idx, d_min_px=4.0, angle_eps_deg=5.0)
+        # 2) Build wireframe FROM POINTS under BAG supervision
+        wf_vertices, wf_edges = wireframe_from_pointcloud(point_cloud[:,0:3], rings_proj)
 
-        # Safety merges: epsilon merge, collapse short edges, and pixel-snap merge
+        # (optional) compact/safety merges with your existing helpers
+        v_before, e_before = int(wf_vertices.shape[0]), int(wf_edges.shape[0])
         wf_vertices, wf_edges, _ = merge_vertices_eps(wf_vertices, wf_edges, eps_px=4.0)
         wf_vertices, wf_edges, _ = collapse_short_edges_adaptive(wf_vertices, wf_edges, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True)
         wf_vertices, wf_edges, _ = merge_vertices_projected(wf_vertices, wf_edges, snap_to_int=True)
+        v_after, e_after = int(wf_vertices.shape[0]), int(wf_edges.shape[0])
 
-        # Integrity counts after merge
-        v_after = int(wf_vertices.shape[0])
-        e_after = int(wf_edges.shape[0])
-
-        # Print and log integrity summary
-        try:
-            print(f"[integrity] {name}: V {v_before}->{v_after}, E {e_before}->{e_after}")
-            log_path = os.path.join(npy_dir, "integrity_log.csv")
-            if not os.path.exists(log_path):
-                with open(log_path, 'w', encoding='utf-8') as lf:
-                    lf.write("name,vertices_before,edges_before,vertices_after,edges_after\n")
-            with open(log_path, 'a', encoding='utf-8') as lf:
-                lf.write(f"{name},{v_before},{e_before},{v_after},{e_after}\n")
-        except Exception:
-            pass
-
+        # 3) Build annot dict from this point-derived wireframe (unchanged)
         vertex_con = defaultdict(set)
-
-        for edge in wf_edges:
-            vertex1, vertex2 = int(edge[0]), int(edge[1])
-            if vertex1 == vertex2:
-                continue
-            if vertex1 < 0 or vertex2 < 0 or vertex1 >= wf_vertices.shape[0] or vertex2 >= wf_vertices.shape[0]:
-                continue
-            vertex_con[vertex1].add(vertex2)
-            vertex_con[vertex2].add(vertex1)
-
+        for a,b in wf_edges:
+            a=int(a); b=int(b)
+            if a!=b: vertex_con[a].add(b); vertex_con[b].add(a)
         vertex_connections1 = {}
-        for vertex, neighbors in vertex_con.items():
-            key = tuple([wf_vertices[vertex][0], wf_vertices[vertex][1], wf_vertices[vertex][2]])
-            vertex_connections1[key] = []
-            for edge_vertex in sorted(list(neighbors)):
-                vertex_connections1[key].append(np.array([
-                    wf_vertices[edge_vertex][0],
-                    wf_vertices[edge_vertex][1],
-                    wf_vertices[edge_vertex][2]
-                ]))
+        for v_idx, neighs in vertex_con.items():
+            key = (wf_vertices[v_idx][0], wf_vertices[v_idx][1], wf_vertices[v_idx][2])
+            vertex_connections1[key] = [np.array([wf_vertices[n][0], wf_vertices[n][1], wf_vertices[n][2]]) for n in sorted(list(neighs))]
+
+        # 4) Save annotation — now **from point cloud**
         npypath = base_path + f"{name}.npy"
         combined = {
             'annot': vertex_connections1,
-            'point_labels': labels,
-            'vertices_proj': wf_vertices,     # projected to 0..255 coords
-            'edges_idx': wf_edges,            # 0-based indices into vertices_proj
+            'point_labels': labels,              # you already computed from rings_proj (okay to keep)
+            'vertices_proj': wf_vertices,        # <- point cloud derived
+            'edges_idx': wf_edges,               # <- point cloud derived
             'integrity': {
                 'vertices_before_merge': v_before,
                 'edges_before_merge': e_before,
@@ -1119,8 +1247,9 @@ def main():
                 'edges_after_merge': e_after,
             },
         }
-        
         np.save(npypath, combined)
+
+
         # show_npy(npypath)
         image = proj_img(point_cloud, name, base_path)
         

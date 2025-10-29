@@ -129,11 +129,12 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
 
     # --- 6) Try rectangle model (min-area rectangle) ---
     rect = cv2.minAreaRect(np.rint(pts_canvas).astype(np.float32))  # (center,(w,h),angle)
-    box = cv2.boxPoints(rect).astype(np.float64)                     # (4,2)
+    box  = cv2.boxPoints(rect).astype(np.float64)                    # (4,2)
 
-    # Score: rectangle vs contour overlap/area similarity
     cont_area = abs(cv2.contourArea(cont_poly.astype(np.float32)))
     rect_area = abs(cv2.contourArea(box.astype(np.float32)))
+
+    H = W = 256
     mask_rect = np.zeros((H, W), np.uint8)
     cv2.fillPoly(mask_rect, [np.rint(box).astype(np.int32)], 1)
     mask_cont = np.zeros((H, W), np.uint8)
@@ -141,41 +142,161 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
 
     intersection = np.logical_and(mask_rect == 1, mask_cont == 1).sum()
     union        = np.logical_or (mask_rect == 1, mask_cont == 1).sum()
-    iou_rect    = (intersection / union) if union > 0 else 0.0
-    area_ratio  = (min(rect_area, cont_area) / max(rect_area, cont_area)) if max(rect_area, cont_area) > 0 else 0.0
+    iou_rect   = (intersection / union) if union > 0 else 0.0
+    area_ratio = (min(rect_area, cont_area) / max(rect_area, cont_area)) if max(rect_area, cont_area) > 0 else 0.0
 
-    USE_RECT = (iou_rect >= 0.70) and (area_ratio >= 0.80)  # tune as needed
+    USE_RECT = (iou_rect >= 0.70) and (area_ratio >= 0.80)
 
     if USE_RECT:
         # --- 7A) Use the rectangle (force 4 vertices, 4 edges) ---
         c = box.mean(axis=0)
         angles = np.arctan2(box[:, 1] - c[1], box[:, 0] - c[0])
         order = np.argsort(angles)  # CCW
-        box = box[order]
+        box   = box[order]
 
         z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
         vertices = np.c_[box, np.full((4,), z_mean, dtype=np.float64)]
         edges    = np.array([[0,1],[1,2],[2,3],[3,0]], dtype=np.int32)
+
     else:
-        # --- 7B) Fallback: stronger simplification ---
-        poly = _rdp(cont_poly, eps=4.0)                 # stronger RDP
-        poly = _dedupe_ring_pixels(poly, px_eps=1.5)
-        if len(poly) < 3:
-            hull = cv2.convexHull(np.rint(cont_poly).astype(np.int32))
+        # ========= BAG-EDGE–GUIDED LINE FITTING (robust for non-rectangular roofs) =========
+        # Input frames: pts_canvas (roof points in XY 0..255), rings_proj (BAG rings in same frame)
+
+        import numpy as np
+        import cv2
+
+        # 0) Choose outer BAG ring and simplify a little (structure prior)
+        bag_outer = max(rings_proj, key=lambda r: r.shape[0])
+        bag_outer = bag_outer.astype(np.float64)
+        bag_simpl = _rdp(bag_outer, eps=3.0)
+        bag_simpl = _dedupe_ring_pixels(bag_simpl, px_eps=1.0)
+
+        # Ensure closed (no duplicate last point)
+        if len(bag_simpl) >= 3 and np.allclose(bag_simpl[0], bag_simpl[-1]):
+            bag_simpl = bag_simpl[:-1]
+
+        K = len(bag_simpl)
+        if K < 3:
+            # Fallback: use contour hull if BAG is degenerate
+            hull = cv2.convexHull(np.rint(pts_canvas).astype(np.int32))
             poly = hull[:, 0, :].astype(np.float64)
+            z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+            vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
+            edges    = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
+        else:
+            # --- helpers ---
+            def _best_fit_line(points_2d):
+                """ principal-axis line fit via SVD; returns (mu(2,), dir(2, unit)) """
+                mu = points_2d.mean(axis=0)
+                C  = points_2d - mu
+                if len(points_2d) < 2:
+                    return mu, np.array([1.0, 0.0], dtype=np.float64)
+                _, _, Vt = np.linalg.svd(C, full_matrices=False)
+                v = Vt[0]
+                v = v / (np.linalg.norm(v) + 1e-12)
+                if v[0] < 0: v = -v
+                return mu, v
 
-        approx = cv2.approxPolyDP(np.rint(poly).astype(np.int32), epsilon=5.0, closed=True)
-        poly2 = approx[:, 0, :].astype(np.float64)
-        if len(poly2) >= 3:
-            poly = poly2
+            def _trimmed_line_fit(points_2d, keep_frac=0.7, iters=2):
+                """ robustify: fit → keep closest keep_frac → refit (a few iters) """
+                S = points_2d
+                for _ in range(iters):
+                    mu, v = _best_fit_line(S)
+                    # 2D signed distance to line through mu with direction v = cross((p-mu), v)
+                    d = np.abs((S[:,0]-mu[0])*v[1] - (S[:,1]-mu[1])*v[0])
+                    k = max(6, int(len(S)*float(keep_frac)))
+                    idx = np.argsort(d)[:k]
+                    S = S[idx]
+                return _best_fit_line(S)
 
-        z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
-        vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
-        edges    = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
+            def _line_intersection(mu1, v1, mu2, v2):
+                """ Intersect lines L1: mu1 + t*v1, L2: mu2 + s*v2 (return 2D point or None) """
+                den = v1[0]*v2[1] - v1[1]*v2[0]
+                if abs(den) < 1e-8:   # near-parallel
+                    return None
+                # Solve for t in mu1 + t*v1 = mu2 + s*v2
+                t = ((mu2[0]-mu1[0])*v2[1] - (mu2[1]-mu1[1])*v2[0]) / den
+                P = mu1 + t*v1
+                return P
 
-    # --- 8) Light cleanup and return ---
+            def _point_to_seg_param(p, a, b):
+                """ Parametric location of proj of p onto segment ab (0..1), unlimited """
+                ab = b - a
+                den = float(np.dot(ab, ab))
+                if den <= 1e-12: return 0.5
+                t = float(np.dot(p - a, ab)) / den
+                return t
+
+            # 1) Build corridors around each BAG edge and collect supporting roof points
+            # corridor width in pixels (tune 4..10 depending on density)
+            CORRIDOR_W = 6.0
+            lines_mu, lines_v = [], []
+            pts = pts_canvas.astype(np.float64)
+
+            for i in range(K):
+                a = bag_simpl[i]
+                b = bag_simpl[(i+1) % K]
+                ab = b - a
+                n_ab = np.linalg.norm(ab) + 1e-12
+                u = ab / n_ab
+                # perpendicular direction
+                n = np.array([-u[1], u[0]], dtype=np.float64)
+
+                # distance to infinite line |(p-a) x u|
+                d_line = np.abs((pts[:,0]-a[0])*u[1] - (pts[:,1]-a[1])*u[0])
+                # param along segment
+                t = ((pts[:,0]-a[0])*u[0] + (pts[:,1]-a[1])*u[1]) / n_ab
+
+                # keep points within lateral band and slightly beyond segment ends
+                keep = (d_line <= CORRIDOR_W) & (t >= -0.15) & (t <= 1.15)
+                support = pts[keep]
+                if len(support) < 6:
+                    # try relaxing width a bit
+                    keep = (d_line <= (CORRIDOR_W*1.5)) & (t >= -0.25) & (t <= 1.25)
+                    support = pts[keep]
+
+                if len(support) >= 6:
+                    mu, v = _trimmed_line_fit(support, keep_frac=0.7, iters=2)
+                else:
+                    # fallback: use the BAG edge direction
+                    mu = 0.5*(a+b)
+                    v  = u
+                lines_mu.append(mu); lines_v.append(v)
+
+            # 2) Intersect consecutive lines to get vertices
+            verts_xy = []
+            for i in range(K):
+                j = (i+1) % K
+                P = _line_intersection(lines_mu[i], lines_v[i], lines_mu[j], lines_v[j])
+                if P is None:
+                    # nearly parallel; pick endpoint of BAG as fallback (closer to both lines)
+                    cand = [bag_simpl[j].copy(), bag_simpl[i].copy()]
+                    if P is None:
+                        P = cand[0]
+                verts_xy.append(P)
+
+            verts_xy = np.array(verts_xy, dtype=np.float64)
+
+            # 3) Optional small regularization: keep them on-segment window (project back)
+            for i in range(K):
+                a = bag_simpl[i]; b = bag_simpl[(i+1)%K]
+                t = _point_to_seg_param(verts_xy[i], a, b)
+                # clamp softly to avoid crazy drifts when intersections are off
+                if t < -0.2: t = -0.2
+                if t >  1.2: t =  1.2
+                verts_xy[i] = a + t*(b - a)
+
+            # 4) Build vertices/edges and cleanup
+            z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+            vertices = np.c_[verts_xy, np.full((K,), z_mean, dtype=np.float64)]
+            edges    = np.array([[i, (i+1) % K] for i in range(K)], dtype=np.int32)
+
+    # --- 8) Light cleanup and SINGLE return ---
+    vertices, edges, _ = collapse_short_edges_adaptive(vertices, edges, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True)
     vertices, edges, _ = merge_vertices_projected(vertices, edges, snap_to_int=True)
     return vertices.astype(np.float64), edges.astype(np.int32)
+
+
 
 
 def merge_adjacent_regions(labels, region_masks):

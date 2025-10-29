@@ -98,12 +98,14 @@ def wireframe_from_pointcloud(pc_xyz_255, bag_rings_proj, d_k=3, dilate=1, close
     uv, (u_axis,v_axis,n_axis,X0) = _project_points_to_plane_uv(roof, a,b,c,d)
     uv_canvas, T_uv2canvas = _normalize_uv_to_canvas(uv, pad=8, size=256)
 
-    # 3) BAG guidance: bring BAG rings into the same canvas via T applied to original XY
+    # 3) BAG guidance: project BAG XY rings directly with the same T_uv2canvas (Option A restored)
     bag_rings_canvas = []
-    for ring in bag_rings_proj:
-        ring_xy1 = np.c_[ring[:,:2], np.ones(len(ring))]
-        ring_canvas = (ring_xy1 @ T_uv2canvas.T)[:,:2]
+    for ring_xy in bag_rings_proj:
+        ring_xy1 = np.c_[ring_xy[:, :2], np.ones(len(ring_xy))]
+        ring_canvas = (ring_xy1 @ T_uv2canvas.T)[:, :2]
         bag_rings_canvas.append(ring_canvas)
+
+
 
     # 4) Keep only points inside BAG mask (safety)
     pts_canvas = uv_canvas  # (M,2)
@@ -1150,8 +1152,6 @@ def visualize_image(image, data_dict, output_dir, index):
 
 def main():
     pc_dir = "./"
-    proj_dir = "./training_data/rgb"
-    npy_dir = "./training_data/annot"
     train_list_path = "./train_list.txt"
     test_list_path = "xxx/test_list.txt"
     
@@ -1159,9 +1159,6 @@ def main():
     polygon_files = build_polygon_files(train_list_path, test_list_path, poly_dir="./")
     
     names = []
-    annotations = []
-    annotation_id = 0
-    images = []
     image_id = 0
 
     for index, path in enumerate(pc_files):
@@ -1191,22 +1188,18 @@ def main():
         centroid = np.mean(point_cloud[:, :3], axis=0)
         point_cloud[:, :3] -= centroid
 
-        r = np.linalg.norm(point_cloud[:, :2], axis=1)  # only XY for normalization
+        # --- scale using XY only + padding ---
+        r = np.linalg.norm(point_cloud[:, :2], axis=1)
         max_distance = np.percentile(r, 99.5)
 
-                
         PAD_SCALE = 0.90  # ~5% margin on each side
+        point_cloud[:, :2] = (point_cloud[:, :2] / max_distance) * (127.5 * PAD_SCALE)
 
-        # XY scaled with padding (to stay inside 256×256)
-        point_cloud[:, :2] = (point_cloud[:, :2] / max(max_distance, 1e-6)) * (127.5 * PAD_SCALE)
+        # --- shift to 0..255 canvas and clip ---
+        point_cloud[:, :3] += 127.5
+        point_cloud[:, :2] = np.clip(point_cloud[:, :2], 0, 255)
+        point_cloud[:,  2] = np.clip(point_cloud[:,  2], 0, 255)
 
-        # Robust Z scaling (optional; for visualization/height channel only)
-        z99 = np.percentile(point_cloud[:, 2], 99.5)
-        point_cloud[:, 2] = (point_cloud[:, 2] / max(z99, 1e-6)) * 127.5
-
-        # Shift to 0..255 canvas and clip
-        point_cloud[:, :3] = point_cloud[:, :3] + 127.5
-        point_cloud[:, :3] = np.clip(point_cloud[:, :3], 0, 255)
 
 
 

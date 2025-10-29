@@ -120,25 +120,61 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
     if dilate > 0: occ = cv2.dilate(occ, np.ones((dilate, d_k), np.uint8))
     if close  > 0: occ = cv2.morphologyEx(occ, cv2.MORPH_CLOSE, np.ones((close, close), np.uint8))
 
+    # --- 5) Get contour as before ---
     contour = _largest_contour_intersecting_bag(occ, bag_mask)
     if contour is None or len(contour) < 3:
         hull = cv2.convexHull(np.rint(pts_canvas).astype(np.int32))
         contour = hull
+    cont_poly = contour[:, 0, :].astype(np.float64)
 
-    # 4) Simplify -> polygon in XY canvas
-    poly = contour[:, 0, :].astype(np.float64)   # (K,2)
-    poly = _rdp(poly, eps=2.5)
-    poly = _dedupe_ring_pixels(poly, px_eps=1.0)
-    if len(poly) < 3:
-        raise RuntimeError("Contour too small after simplification")
+    # --- 6) Try rectangle model (min-area rectangle) ---
+    rect = cv2.minAreaRect(np.rint(pts_canvas).astype(np.float32))  # (center,(w,h),angle)
+    box = cv2.boxPoints(rect).astype(np.float64)                     # (4,2)
 
-    # 5) Build vertices (with Z) and edges (ring), then light cleanup
-    z_mean = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
-    vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
-    edges = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
+    # Score: rectangle vs contour overlap/area similarity
+    cont_area = abs(cv2.contourArea(cont_poly.astype(np.float32)))
+    rect_area = abs(cv2.contourArea(box.astype(np.float32)))
+    mask_rect = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(mask_rect, [np.rint(box).astype(np.int32)], 1)
+    mask_cont = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(mask_cont, [np.rint(cont_poly).astype(np.int32)], 1)
 
+    intersection = np.logical_and(mask_rect == 1, mask_cont == 1).sum()
+    union        = np.logical_or (mask_rect == 1, mask_cont == 1).sum()
+    iou_rect    = (intersection / union) if union > 0 else 0.0
+    area_ratio  = (min(rect_area, cont_area) / max(rect_area, cont_area)) if max(rect_area, cont_area) > 0 else 0.0
+
+    USE_RECT = (iou_rect >= 0.70) and (area_ratio >= 0.80)  # tune as needed
+
+    if USE_RECT:
+        # --- 7A) Use the rectangle (force 4 vertices, 4 edges) ---
+        c = box.mean(axis=0)
+        angles = np.arctan2(box[:, 1] - c[1], box[:, 0] - c[0])
+        order = np.argsort(angles)  # CCW
+        box = box[order]
+
+        z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+        vertices = np.c_[box, np.full((4,), z_mean, dtype=np.float64)]
+        edges    = np.array([[0,1],[1,2],[2,3],[3,0]], dtype=np.int32)
+    else:
+        # --- 7B) Fallback: stronger simplification ---
+        poly = _rdp(cont_poly, eps=4.0)                 # stronger RDP
+        poly = _dedupe_ring_pixels(poly, px_eps=1.5)
+        if len(poly) < 3:
+            hull = cv2.convexHull(np.rint(cont_poly).astype(np.int32))
+            poly = hull[:, 0, :].astype(np.float64)
+
+        approx = cv2.approxPolyDP(np.rint(poly).astype(np.int32), epsilon=5.0, closed=True)
+        poly2 = approx[:, 0, :].astype(np.float64)
+        if len(poly2) >= 3:
+            poly = poly2
+
+        z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+        vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
+        edges    = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
+
+    # --- 8) Light cleanup and return ---
     vertices, edges, _ = merge_vertices_projected(vertices, edges, snap_to_int=True)
-
     return vertices.astype(np.float64), edges.astype(np.int32)
 
 

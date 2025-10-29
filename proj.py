@@ -159,137 +159,155 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
         edges    = np.array([[0,1],[1,2],[2,3],[3,0]], dtype=np.int32)
 
     else:
-        # ========= BAG-EDGE–GUIDED LINE FITTING (robust for non-rectangular roofs) =========
-        # Input frames: pts_canvas (roof points in XY 0..255), rings_proj (BAG rings in same frame)
 
-        import numpy as np
-        import cv2
+        # --- Build a simplified outer BAG ring in the SAME 0..255 canvas as pts_canvas ---
+        # rings_proj must already be mapped to the 0..255 canvas (your earlier code does this).
+        # Pick the largest ring (outer boundary), simplify, dedupe, and ensure CCW order.
 
-        # 0) Choose outer BAG ring and simplify a little (structure prior)
-        bag_outer = max(rings_proj, key=lambda r: r.shape[0])
-        bag_outer = bag_outer.astype(np.float64)
-        bag_simpl = _rdp(bag_outer, eps=3.0)
+        assert len(rings_proj) > 0, "rings_proj is empty; build it before this block."
+
+        # 1) choose the outer ring (max area)
+        def _ring_area_xy(r):
+            # signed area; magnitude picks outer ring
+            x, y = r[:,0], r[:,1]
+            return 0.5 * np.sum(x*np.roll(y,-1) - y*np.roll(x,-1))
+
+        bag_outer = max(rings_proj, key=lambda r: abs(_ring_area_xy(np.asarray(r, dtype=np.float64))))
+
+        # 2) clean & simplify
+        bag_simpl = np.asarray(bag_outer, dtype=np.float64)
+        # drop duplicate last point if closed
+        if bag_simpl.shape[0] >= 2 and np.allclose(bag_simpl[0], bag_simpl[-1]):
+            bag_simpl = bag_simpl[:-1]
+        bag_simpl = _rdp(bag_simpl, eps=3.0)
         bag_simpl = _dedupe_ring_pixels(bag_simpl, px_eps=1.0)
 
-        # Ensure closed (no duplicate last point)
-        if len(bag_simpl) >= 3 and np.allclose(bag_simpl[0], bag_simpl[-1]):
-            bag_simpl = bag_simpl[:-1]
+        # 3) enforce CCW ordering (optional but helps consistency)
+        c = bag_simpl.mean(axis=0)
+        ang = np.arctan2(bag_simpl[:,1]-c[1], bag_simpl[:,0]-c[0])
+        order = np.argsort(ang)     # CCW
+        bag_simpl = bag_simpl[order]
 
-        K = len(bag_simpl)
-        if K < 3:
-            # Fallback: use contour hull if BAG is degenerate
-            hull = cv2.convexHull(np.rint(pts_canvas).astype(np.int32))
-            poly = hull[:, 0, :].astype(np.float64)
-            z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
-            vertices = np.c_[poly, np.full((len(poly),), z_mean, dtype=np.float64)]
-            edges    = np.array([[i, (i+1) % len(vertices)] for i in range(len(vertices))], dtype=np.int32)
-        else:
-            # --- helpers ---
-            def _best_fit_line(points_2d):
-                """ principal-axis line fit via SVD; returns (mu(2,), dir(2, unit)) """
-                mu = points_2d.mean(axis=0)
-                C  = points_2d - mu
-                if len(points_2d) < 2:
-                    return mu, np.array([1.0, 0.0], dtype=np.float64)
-                _, _, Vt = np.linalg.svd(C, full_matrices=False)
-                v = Vt[0]
-                v = v / (np.linalg.norm(v) + 1e-12)
-                if v[0] < 0: v = -v
-                return mu, v
+        # 4) safety: need at least a triangle
+        if bag_simpl.shape[0] < 3:
+            hull = cv2.convexHull(np.rint(bag_outer).astype(np.int32))
+            bag_simpl = hull[:,0,:].astype(np.float64)
 
-            def _trimmed_line_fit(points_2d, keep_frac=0.7, iters=2):
-                """ robustify: fit → keep closest keep_frac → refit (a few iters) """
-                S = points_2d
-                for _ in range(iters):
-                    mu, v = _best_fit_line(S)
-                    # 2D signed distance to line through mu with direction v = cross((p-mu), v)
-                    d = np.abs((S[:,0]-mu[0])*v[1] - (S[:,1]-mu[1])*v[0])
-                    k = max(6, int(len(S)*float(keep_frac)))
-                    idx = np.argsort(d)[:k]
-                    S = S[idx]
-                return _best_fit_line(S)
+        K = int(bag_simpl.shape[0])
 
-            def _line_intersection(mu1, v1, mu2, v2):
-                """ Intersect lines L1: mu1 + t*v1, L2: mu2 + s*v2 (return 2D point or None) """
-                den = v1[0]*v2[1] - v1[1]*v2[0]
-                if abs(den) < 1e-8:   # near-parallel
-                    return None
-                # Solve for t in mu1 + t*v1 = mu2 + s*v2
-                t = ((mu2[0]-mu1[0])*v2[1] - (mu2[1]-mu1[1])*v2[0]) / den
-                P = mu1 + t*v1
-                return P
 
-            def _point_to_seg_param(p, a, b):
-                """ Parametric location of proj of p onto segment ab (0..1), unlimited """
-                ab = b - a
-                den = float(np.dot(ab, ab))
-                if den <= 1e-12: return 0.5
-                t = float(np.dot(p - a, ab)) / den
-                return t
+        # --- BAG-locked orientation, offset-only line fitting ---
+        # We keep each edge direction = BAG edge direction u, and fit only normal offset t0.
+        # This prevents angle drift and stabilizes corners.
 
-            # 1) Build corridors around each BAG edge and collect supporting roof points
-            # corridor width in pixels (tune 4..10 depending on density)
-            CORRIDOR_W = 6.0
-            lines_mu, lines_v = [], []
-            pts = pts_canvas.astype(np.float64)
+        CORRIDOR_W  = 5.0   # half-width (px) of the band around each BAG edge (try 4–8)
+        TRIM_FRAC   = 0.70  # keep central 70% by |t - median_t|
+        EXTRA_BAND  = 0.12  # allow +/- 12% beyond segment ends when collecting support
 
-            for i in range(K):
-                a = bag_simpl[i]
-                b = bag_simpl[(i+1) % K]
-                ab = b - a
-                n_ab = np.linalg.norm(ab) + 1e-12
-                u = ab / n_ab
-                # perpendicular direction
-                n = np.array([-u[1], u[0]], dtype=np.float64)
+        pts = pts_canvas.astype(np.float64)
+        lines_u  = []   # direction (unit) = BAG edge direction
+        lines_n  = []   # outward normal (unit) = [-u_y, u_x]
+        lines_t0 = []   # fitted normal offset (scalar, px)
+        lines_ref= []   # a_i reference (the BAG edge start point)
 
-                # distance to infinite line |(p-a) x u|
-                d_line = np.abs((pts[:,0]-a[0])*u[1] - (pts[:,1]-a[1])*u[0])
-                # param along segment
-                t = ((pts[:,0]-a[0])*u[0] + (pts[:,1]-a[1])*u[1]) / n_ab
+        for i in range(K):
+            a = bag_simpl[i]
+            b = bag_simpl[(i + 1) % K]
+            ab = b - a
+            L  = np.linalg.norm(ab) + 1e-12
+            u  = ab / L                              # fixed direction
+            n  = np.array([-u[1], u[0]], dtype=np.float64)  # fixed normal
 
-                # keep points within lateral band and slightly beyond segment ends
-                keep = (d_line <= CORRIDOR_W) & (t >= -0.15) & (t <= 1.15)
-                support = pts[keep]
-                if len(support) < 6:
-                    # try relaxing width a bit
-                    keep = (d_line <= (CORRIDOR_W*1.5)) & (t >= -0.25) & (t <= 1.25)
-                    support = pts[keep]
+            # local coords: s along u, t along n
+            s = (pts - a) @ u
+            t = (pts - a) @ n
 
-                if len(support) >= 6:
-                    mu, v = _trimmed_line_fit(support, keep_frac=0.7, iters=2)
-                else:
-                    # fallback: use the BAG edge direction
-                    mu = 0.5*(a+b)
-                    v  = u
-                lines_mu.append(mu); lines_v.append(v)
+            # support: narrow band in t, and slightly extended along s around [0, L]
+            keep = (np.abs(t) <= CORRIDOR_W) & (s >= -EXTRA_BAND * L) & (s <= (1.0 + EXTRA_BAND) * L)
+            S = s[keep]; T = t[keep]
 
-            # 2) Intersect consecutive lines to get vertices
-            verts_xy = []
-            for i in range(K):
-                j = (i+1) % K
-                P = _line_intersection(lines_mu[i], lines_v[i], lines_mu[j], lines_v[j])
-                if P is None:
-                    # nearly parallel; pick endpoint of BAG as fallback (closer to both lines)
-                    cand = [bag_simpl[j].copy(), bag_simpl[i].copy()]
-                    if P is None:
-                        P = cand[0]
-                verts_xy.append(P)
+            if S.size < 8:
+                # widen once if too few
+                keep = (np.abs(t) <= (1.5 * CORRIDOR_W)) & (s >= -0.20 * L) & (s <= 1.20 * L)
+                S = s[keep]; T = t[keep]
 
-            verts_xy = np.array(verts_xy, dtype=np.float64)
+            if S.size >= 8:
+                # robust offset: trim around median
+                med = float(np.median(T))
+                resid = np.abs(T - med)
+                k = max(8, int(TRIM_FRAC * len(T)))
+                idx = np.argsort(resid)[:k]
+                T_trim = T[idx]
+                t0 = float(np.median(T_trim))        # robust normal offset
+            else:
+                t0 = 0.0                             # fallback to BAG line
 
-            # 3) Optional small regularization: keep them on-segment window (project back)
-            for i in range(K):
-                a = bag_simpl[i]; b = bag_simpl[(i+1)%K]
-                t = _point_to_seg_param(verts_xy[i], a, b)
-                # clamp softly to avoid crazy drifts when intersections are off
-                if t < -0.2: t = -0.2
-                if t >  1.2: t =  1.2
-                verts_xy[i] = a + t*(b - a)
+            lines_u.append(u)
+            lines_n.append(n)
+            lines_t0.append(t0)
+            lines_ref.append(a)
 
-            # 4) Build vertices/edges and cleanup
-            z_mean   = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
-            vertices = np.c_[verts_xy, np.full((K,), z_mean, dtype=np.float64)]
-            edges    = np.array([[i, (i+1) % K] for i in range(K)], dtype=np.int32)
+        # --- intersect consecutive fixed-orientation lines ---
+        # Each line i is: { x | (x - a_i)·n_i = t0_i } with direction u_i
+        def _intersect_fixed(a1, n1, t01, a2, n2, t02):
+            # Solve for x:  n1·x = n1·a1 + t01,  n2·x = n2·a2 + t02
+            A = np.array([n1, n2], dtype=np.float64)     # 2x2
+            b = np.array([n1 @ a1 + t01, n2 @ a2 + t02], dtype=np.float64)
+            det = A[0,0]*A[1,1] - A[0,1]*A[1,0]
+            if abs(det) < 1e-10:
+                # nearly parallel normals -> average BAG vertices
+                return 0.5 * (a2 + a1)
+            x = np.linalg.solve(A, b)
+            return x
+
+        verts_xy = []
+        for i in range(K):
+            j = (i + 1) % K
+            P = _intersect_fixed(
+                lines_ref[i],   lines_n[i],   lines_t0[i],
+                lines_ref[j],   lines_n[j],   lines_t0[j]
+            )
+            # soft clamp toward BAG vertex to avoid far drift
+            vbag = bag_simpl[(i + 1) % K]
+            d = np.linalg.norm(P - vbag)
+            if d > 8.0:
+                P = vbag + (P - vbag) * (8.0 / (d + 1e-12))
+            verts_xy.append(P)
+
+        verts_xy = np.array(verts_xy, dtype=np.float64)
+
+        # --- prune tiny edges & needle angles (same as before, but keep moderate) ---
+        def _angle(a, b, c):
+            v1 = a - b; v2 = c - b
+            n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6: return 180.0
+            cos = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+            return np.degrees(np.arccos(cos))
+
+        MIN_EDGE  = 5.0      # was 6.0; slightly softer
+        MIN_ANGLE = 10.0     # was 12.0; keep more shallow corners
+
+        keep = [True] * K
+        for i in range(K):
+            if np.linalg.norm(verts_xy[i] - verts_xy[(i+1) % K]) < MIN_EDGE:
+                keep[(i+1) % K] = False
+        verts_xy = verts_xy[np.array(keep, dtype=bool)]
+
+        Kc = len(verts_xy)
+        if Kc >= 3:
+            keep = [True] * Kc
+            for i in range(Kc):
+                ang = _angle(verts_xy[(i-1) % Kc], verts_xy[i], verts_xy[(i+1) % Kc])
+                if ang < MIN_ANGLE:
+                    keep[i] = False
+            verts_xy = verts_xy[np.array(keep, dtype=bool)]
+
+        # build vertices/edges with z
+        z_mean = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
+        vertices = np.c_[verts_xy, np.full((len(verts_xy),), z_mean, dtype=np.float64)]
+        edges    = np.array([[i, (i+1) % len(verts_xy)] for i in range(len(verts_xy))], dtype=np.int32)
+
+
 
     # --- 8) Light cleanup and SINGLE return ---
     vertices, edges, _ = collapse_short_edges_adaptive(vertices, edges, base_px=4.0, alpha=0.20, verbose=False, snap_endpoint=True)

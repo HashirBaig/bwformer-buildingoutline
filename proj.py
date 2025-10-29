@@ -81,6 +81,13 @@ def _largest_contour_intersecting_bag(bin_img, bag_mask):
                 best, best_area = c, area
     return best
 
+
+def _signed_area(poly):
+    # poly: (K,2) ordered ring
+    x = poly[:,0]; y = poly[:,1]
+    return 0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))
+
+
 def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
     """
     Build vertices/edges from POINT CLOUD under BAG guidance in the XY canvas (0..255).
@@ -195,6 +202,9 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
 
         K = int(bag_simpl.shape[0])
 
+        # Determine winding to set outward normal consistently
+        is_ccw = _signed_area(bag_simpl) > 0.0  # True if CCW
+
 
         # --- BAG-locked orientation, offset-only line fitting ---
         # We keep each edge direction = BAG edge direction u, and fit only normal offset t0.
@@ -216,8 +226,10 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
             ab = b - a
             L  = np.linalg.norm(ab) + 1e-12
             u  = ab / L                              # fixed direction
-            n  = np.array([-u[1], u[0]], dtype=np.float64)  # fixed normal
-
+            if is_ccw:
+                n = np.array([ u[1], -u[0] ], dtype=np.float64)   # outward for CCW ring
+            else:
+                n = np.array([-u[1],  u[0] ], dtype=np.float64)   # outward for CW ring
             # local coords: s along u, t along n
             s = (pts - a) @ u
             t = (pts - a) @ n
@@ -226,21 +238,35 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
             keep = (np.abs(t) <= CORRIDOR_W) & (s >= -EXTRA_BAND * L) & (s <= (1.0 + EXTRA_BAND) * L)
             S = s[keep]; T = t[keep]
 
-            if S.size < 8:
-                # widen once if too few
-                keep = (np.abs(t) <= (1.5 * CORRIDOR_W)) & (s >= -0.20 * L) & (s <= 1.20 * L)
-                S = s[keep]; T = t[keep]
-
             if S.size >= 8:
-                # robust offset: trim around median
                 med = float(np.median(T))
                 resid = np.abs(T - med)
                 k = max(8, int(TRIM_FRAC * len(T)))
                 idx = np.argsort(resid)[:k]
                 T_trim = T[idx]
-                t0 = float(np.median(T_trim))        # robust normal offset
+
+                # extreme in the outward direction, but bounded & blended
+                p_hi = float(np.percentile(T_trim, 85.0))
+                p_lo = float(np.percentile(T_trim, 15.0))
+
+                # outward means positive along n if our n is set "outward" as above
+                if med >= 0:
+                    t_ext = p_hi
+                else:
+                    t_ext = p_lo
+
+                # blend: move 60% from median toward outward extreme (safer than jumping to the extreme)
+                t_target = med + 0.6 * (t_ext - med)
+
+                # cap by a robust envelope so we don't overshoot sparse edges
+                max_abs = float(np.percentile(np.abs(T_trim), 90.0))
+                t_target = np.clip(t_target, -max_abs, max_abs)
+
+                t0 = float(t_target)
             else:
-                t0 = 0.0                             # fallback to BAG line
+                t0 = 0.0
+
+                                        # fallback to BAG line
 
             lines_u.append(u)
             lines_n.append(n)
@@ -260,12 +286,49 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
             x = np.linalg.solve(A, b)
             return x
 
+        # --- refinement: nudge each edge outward to hug the outer support ---
+        MAX_PUSH   = 4.0     # px, safety cap per edge adjustment
+        REF_TRIM   = 0.70    # keep central 70% again
+
+        for i in range(K):
+            a = lines_ref[i]
+            u = lines_u[i]
+            n = lines_n[i]
+            t0 = lines_t0[i]
+
+            # Recompute local coords for all points
+            s = (pts - a) @ u
+            t = (pts - a) @ n
+            L = np.linalg.norm(bag_simpl[(i+1)%K] - bag_simpl[i]) + 1e-12
+
+            keep = (np.abs(t - t0) <= CORRIDOR_W) & (s >= -EXTRA_BAND * L) & (s <= (1.0 + EXTRA_BAND) * L)
+            T_edge = t[keep]
+            if T_edge.size < 8:
+                continue
+
+            med = float(np.median(T_edge))
+            # Trim around median
+            resid = np.abs(T_edge - med)
+            k = max(8, int(REF_TRIM * len(T_edge)))
+            idx = np.argsort(resid)[:k]
+            T_trim = T_edge[idx]
+
+            # Target offset toward the dense outer boundary
+            if med >= 0:
+                t_target = float(np.percentile(T_trim, 90.0))
+            else:
+                t_target = float(np.percentile(T_trim, 10.0))
+
+            delta = np.clip(t_target - t0, -MAX_PUSH, MAX_PUSH)
+            lines_t0[i] = t0 + delta
+
+        # --- recompute intersections with refined offsets ---
         verts_xy = []
         for i in range(K):
             j = (i + 1) % K
             P = _intersect_fixed(
-                lines_ref[i],   lines_n[i],   lines_t0[i],
-                lines_ref[j],   lines_n[j],   lines_t0[j]
+                lines_ref[i], lines_n[i], lines_t0[i],
+                lines_ref[j], lines_n[j], lines_t0[j]
             )
             # soft clamp toward BAG vertex to avoid far drift
             vbag = bag_simpl[(i + 1) % K]
@@ -284,13 +347,13 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
             cos = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
             return np.degrees(np.arccos(cos))
 
-        MIN_EDGE  = 5.0      # was 6.0; slightly softer
-        MIN_ANGLE = 10.0     # was 12.0; keep more shallow corners
+        MIN_EDGE  = 5.0      # slightly softer
+        MIN_ANGLE = 10.0     # keep more shallow corners
 
-        keep = [True] * K
-        for i in range(K):
-            if np.linalg.norm(verts_xy[i] - verts_xy[(i+1) % K]) < MIN_EDGE:
-                keep[(i+1) % K] = False
+        keep = [True] * len(verts_xy)
+        for i in range(len(verts_xy)):
+            if np.linalg.norm(verts_xy[i] - verts_xy[(i+1) % len(verts_xy)]) < MIN_EDGE:
+                keep[(i+1) % len(verts_xy)] = False
         verts_xy = verts_xy[np.array(keep, dtype=bool)]
 
         Kc = len(verts_xy)
@@ -302,10 +365,11 @@ def wireframe_from_pointcloud(pc_xyz_255, rings_proj, d_k=3, dilate=1, close=3):
                     keep[i] = False
             verts_xy = verts_xy[np.array(keep, dtype=bool)]
 
-        # build vertices/edges with z
+        # --- build vertices/edges with z ---
         z_mean = float(np.median(roof_kept[:, 2])) if roof_kept.size else 0.0
         vertices = np.c_[verts_xy, np.full((len(verts_xy),), z_mean, dtype=np.float64)]
         edges    = np.array([[i, (i+1) % len(verts_xy)] for i in range(len(verts_xy))], dtype=np.int32)
+
 
 
 
